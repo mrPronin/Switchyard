@@ -268,6 +268,11 @@ impl Backend {
         format!("{}/count_tokens", anthropic_url(base_url))
     }
 
+    // Resolves an OpenAI endpoint from the same configured base URL as Responses calls.
+    pub(crate) fn openai_endpoint_url(&self, suffix: &str) -> String {
+        openai_url(self.config().base_url.trim_end_matches('/'), suffix)
+    }
+
     /// Whether an upstream 400 `body` looks like a context-window overflow for
     /// this backend's provider.
     pub(crate) fn is_context_overflow(&self, body: &str) -> bool {

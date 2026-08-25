@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use http::StatusCode;
 use reqwest::RequestBuilder;
-use reqwest::header::{HeaderMap, RETRY_AFTER};
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER};
 use serde_json::{Map, Value};
 use switchyard_protocol::{
     LlmRequest, LlmResponse, Metadata, ModelId, Request, Response, RoutedLlmClient,
@@ -94,6 +94,31 @@ pub struct TranslatingLlmClient {
     forward_auth_client: reqwest::Client,
 }
 
+/// Provider-native OpenAI request proxied without translation.
+pub enum OpenAiPassthroughRequest {
+    /// Count input tokens using `POST /v1/responses/input_tokens`.
+    ResponsesInputTokens(Value),
+    /// Compact conversation input using `POST /v1/responses/compact`.
+    ResponsesCompact(Value),
+    /// Upload multipart form data using `POST /v1/files`.
+    File {
+        /// Uninspected multipart request body.
+        body: reqwest::Body,
+        /// Multipart content type, including its boundary.
+        content_type: HeaderValue,
+    },
+}
+
+impl OpenAiPassthroughRequest {
+    const fn suffix(&self) -> &'static str {
+        match self {
+            Self::ResponsesInputTokens(_) => "/responses/input_tokens",
+            Self::ResponsesCompact(_) => "/responses/compact",
+            Self::File { .. } => "/files",
+        }
+    }
+}
+
 impl TranslatingLlmClient {
     /// Builds a client over the given [`ModelConfig`]s, with a fresh shared HTTP
     /// client and the built-in translation codecs.
@@ -148,6 +173,62 @@ impl TranslatingLlmClient {
     pub fn supports_count_tokens(&self, model: &ModelId) -> bool {
         self.backend_for(model, WireFormat::AnthropicMessages)
             .is_some()
+    }
+
+    /// Proxies an auxiliary OpenAI request through `model`'s Responses backend.
+    ///
+    /// Responses JSON remains provider-native except that `model` is replaced with
+    /// the configured upstream model id. File bodies and all responses remain uninspected.
+    pub async fn passthrough_openai(
+        &self,
+        model: &ModelId,
+        request: OpenAiPassthroughRequest,
+        metadata: Option<&Metadata>,
+    ) -> Result<reqwest::Response> {
+        let backend = self
+            .backend_for(model, WireFormat::OpenAiResponses)
+            .ok_or_else(|| LlmClientError::Configuration {
+                message: format!("model {model} has no OpenAI Responses backend"),
+            })?;
+        let url = backend.openai_endpoint_url(request.suffix());
+        let builder = match request {
+            OpenAiPassthroughRequest::ResponsesInputTokens(mut body)
+            | OpenAiPassthroughRequest::ResponsesCompact(mut body) => {
+                if !body.is_object() {
+                    return Err(LlmClientError::InvalidRequest {
+                        message: "request body must be a JSON object".to_string(),
+                    });
+                }
+                set_json_model(&mut body, model);
+                self.http_client(backend).post(url).json(&body)
+            }
+            OpenAiPassthroughRequest::File { body, content_type } => self
+                .http_client(backend)
+                .post(url)
+                .header(CONTENT_TYPE, content_type)
+                .body(body),
+        };
+        let builder = forward_metadata_headers(builder, metadata);
+        let builder = backend.apply_forwarded_auth(builder, metadata);
+        let builder = apply_extra_headers(builder, backend);
+        let builder = backend.apply_auth(builder);
+        let response = match builder.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                metrics::record_upstream_attempt(None);
+                return Err(convert_reqwest_error(error));
+            }
+        };
+        metrics::record_upstream_attempt(Some(response.status().as_u16()));
+        Ok(response)
+    }
+
+    fn http_client(&self, backend: &Backend) -> &reqwest::Client {
+        if backend.is_forwarding_auth() {
+            &self.forward_auth_client
+        } else {
+            &self.client
+        }
     }
 
     /// Counts input tokens with `model`'s Anthropic backend.
@@ -298,11 +379,7 @@ impl TranslatingLlmClient {
         model: &ModelId,
         streaming: bool,
     ) -> std::result::Result<EncodedResponse, AttemptFailure> {
-        let client = if backend.is_forwarding_auth() {
-            &self.forward_auth_client
-        } else {
-            &self.client
-        };
+        let client = self.http_client(backend);
         let builder = client.post(url).json(body);
         let builder = forward_metadata_headers(builder, metadata);
         let builder = backend.apply_forwarded_auth(builder, metadata);

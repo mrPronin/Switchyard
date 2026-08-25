@@ -23,6 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use axum::body::Body;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Query, Request as HttpRequest, State};
 use axum::http::header::CONTENT_TYPE;
@@ -36,7 +37,7 @@ use libsy::{Algorithm, LibsyError, RoutingOutcome};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use switchyard_llm_client::{ClientRouter, RunObservation, RunObserver};
+use switchyard_llm_client::{ClientRouter, OpenAiPassthroughRequest, RunObservation, RunObserver};
 use switchyard_protocol::{LlmClientError, Metadata, ModelId, Request, Usage};
 use switchyard_runner::{
     CallerAuthKind, DecisionTarget, ModelCapabilities, Route, RunOutput, Runner, RunnerError,
@@ -474,6 +475,12 @@ pub fn build_switchyard_router(state: ServerState) -> Router {
         .route("/v1/chat/completions", post(openai_chat_completions))
         .route("/v1/messages", post(anthropic_messages))
         .route("/v1/responses", post(openai_responses))
+        .route(
+            "/v1/responses/input_tokens",
+            post(openai_responses_input_tokens),
+        )
+        .route("/v1/responses/compact", post(openai_responses_compact))
+        .route("/v1/files", post(openai_files))
         .route("/v1/decision", post(decision))
         .route("/v1/messages/count_tokens", post(anthropic_count_tokens))
         .route("/v1/models", get(models))
@@ -534,6 +541,85 @@ async fn openai_responses(
     body: std::result::Result<Json<Value>, JsonRejection>,
 ) -> Response {
     handle_endpoint(state, started, headers, body, WireFormat::OpenAiResponses).await
+}
+
+async fn openai_responses_input_tokens(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    body: std::result::Result<Json<Value>, JsonRejection>,
+) -> Response {
+    passthrough_responses_json(
+        state,
+        headers,
+        body,
+        OpenAiPassthroughRequest::ResponsesInputTokens,
+    )
+    .await
+}
+
+async fn openai_responses_compact(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    body: std::result::Result<Json<Value>, JsonRejection>,
+) -> Response {
+    passthrough_responses_json(
+        state,
+        headers,
+        body,
+        OpenAiPassthroughRequest::ResponsesCompact,
+    )
+    .await
+}
+
+async fn passthrough_responses_json(
+    state: ServerState,
+    headers: HeaderMap,
+    body: std::result::Result<Json<Value>, JsonRejection>,
+    request: fn(Value) -> OpenAiPassthroughRequest,
+) -> Response {
+    let body = match llm_json_body(body) {
+        Ok(body) => body,
+        Err((status, message)) => return invalid_body_error(status, message),
+    };
+    let route = match resolve_requested_route(
+        &state,
+        body.get("model").and_then(Value::as_str),
+        WireFormat::OpenAiResponses,
+    ) {
+        Ok(route) => route,
+        Err(response) => return response,
+    };
+    match route
+        .passthrough_openai(request(body), metadata_from_headers(headers))
+        .await
+    {
+        Ok(response) => passthrough_response(response),
+        Err(error) => runner_error(error),
+    }
+}
+
+async fn openai_files(State(state): State<ServerState>, request: HttpRequest) -> Response {
+    let (parts, body) = request.into_parts();
+    let Some(content_type) = parts.headers.get(CONTENT_TYPE).cloned() else {
+        return invalid_body_error(
+            StatusCode::BAD_REQUEST,
+            "request must include a Content-Type header",
+        );
+    };
+    let metadata = metadata_from_headers(parts.headers);
+    let request = OpenAiPassthroughRequest::File {
+        body: reqwest::Body::wrap_stream(body.into_data_stream()),
+        content_type,
+    };
+    match state.runner.passthrough_openai(request, metadata).await {
+        Ok(response) => passthrough_response(response),
+        Err(error) => runner_error(error),
+    }
+}
+
+fn passthrough_response(upstream: reqwest::Response) -> Response {
+    let response: http::Response<reqwest::Body> = upstream.into();
+    response.map(Body::new)
 }
 
 /// One provider request submitted for a routing decision without an answer-model call.
@@ -744,9 +830,22 @@ fn resolve_route(
 ) -> std::result::Result<(&Route, Request), Response> {
     let llm_request = decode_request(wire_format, &body)
         .map_err(|error| invalid_body_error(StatusCode::BAD_REQUEST, error.to_string()))?;
-    let requested_model = llm_request
-        .model
-        .clone()
+    let route = resolve_requested_route(state, llm_request.model.as_deref(), wire_format)?;
+    let request = Request {
+        llm_request,
+        raw_request: Some(body),
+        metadata: Some(metadata),
+    };
+    Ok((route, request))
+}
+
+#[allow(clippy::result_large_err)]
+fn resolve_requested_route<'a>(
+    state: &'a ServerState,
+    requested_model: Option<&str>,
+    wire_format: WireFormat,
+) -> std::result::Result<&'a Route, Response> {
+    let requested_model = requested_model
         .filter(|model| !model.trim().is_empty())
         .ok_or_else(|| {
             error_response(
@@ -756,7 +855,7 @@ fn resolve_route(
                 "invalid_request_error",
             )
         })?;
-    let route = state.route_for_model(&requested_model).ok_or_else(|| {
+    let route = state.route_for_model(requested_model).ok_or_else(|| {
         error_response(
             StatusCode::NOT_FOUND,
             format!("No route registered for model {requested_model}"),
@@ -780,12 +879,7 @@ fn resolve_route(
             "invalid_request_error",
         ));
     }
-    let request = Request {
-        llm_request,
-        raw_request: Some(body),
-        metadata: Some(metadata),
-    };
-    Ok((route, request))
+    Ok(route)
 }
 
 async fn handle_llm_request(
@@ -950,6 +1044,12 @@ fn runner_error(error: RunnerError) -> Response {
     match error {
         RunnerError::Algorithm(error) => algorithm_error(error),
         RunnerError::Client(error) => client_error(&error),
+        RunnerError::ResponsesPassthroughUnsupported => error_response(
+            StatusCode::BAD_REQUEST,
+            error.to_string(),
+            "invalid_request_error",
+            "responses_target_unavailable",
+        ),
         error => server_error(error.to_string()),
     }
 }
@@ -1397,6 +1497,9 @@ fn endpoint_listing(has_routing_log: bool) -> String {
         "  POST /v1/chat/completions    OpenAI Chat Completions",
         "  POST /v1/messages            Anthropic Messages",
         "  POST /v1/responses           OpenAI Responses",
+        "  POST /v1/responses/input_tokens",
+        "  POST /v1/responses/compact",
+        "  POST /v1/files",
         "  POST /v1/messages/count_tokens",
         "  GET  /v1/models              configured routes",
         "  GET  /v1/stats               routing stats",

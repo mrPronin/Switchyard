@@ -17,6 +17,7 @@ use switchyard_llm_client::{
 };
 use switchyard_protocol::{ModelId, RoutedLlmClient, WireFormat};
 
+use crate::route::ResponsesTarget;
 use crate::{
     AlgorithmSpec, CallerAuthKind, CountTokensTarget, DecisionTarget, ModelCapabilities, Route,
     Runner, RunnerError,
@@ -189,6 +190,7 @@ impl DeploymentConfig {
             let (route_clients, caller_auth) =
                 self.build_route_clients(route_name, config, &clients)?;
             let count_tokens_target = self.build_count_tokens_target(config, &clients);
+            let responses_target = self.build_responses_target(config, &clients);
             let decision_targets = config
                 .routing_target_names()
                 .into_iter()
@@ -201,7 +203,8 @@ impl DeploymentConfig {
                 capabilities,
                 count_tokens_target,
                 decision_targets,
-            );
+            )
+            .with_responses_target(responses_target);
             routes.push((config.id.clone(), route));
         }
         Ok(Runner::new(routes))
@@ -315,6 +318,24 @@ impl DeploymentConfig {
                 model: target.id.clone(),
                 client: client.clone(),
             })
+    }
+
+    fn build_responses_target(
+        &self,
+        route: &RouteConfig,
+        clients: &BTreeMap<String, Arc<TranslatingLlmClient>>,
+    ) -> Option<ResponsesTarget> {
+        route.routing_target_names().into_iter().find_map(|name| {
+            let target = self.targets.get(name)?;
+            let client = clients.get(&target.llm_client)?;
+            client
+                .backend_for(&target.id, WireFormat::OpenAiResponses)
+                .is_some()
+                .then(|| ResponsesTarget {
+                    model: target.id.clone(),
+                    client: client.clone(),
+                })
+        })
     }
 }
 

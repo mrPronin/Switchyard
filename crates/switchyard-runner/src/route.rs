@@ -8,8 +8,10 @@ use std::sync::Arc;
 
 use libsy::{Algorithm, CallModel, LibsyError, RoutingOutcome, drive};
 use serde_json::Value;
-use switchyard_llm_client::{ClientRouter, RunObserver, TranslatingLlmClient};
-use switchyard_protocol::{LlmClientError, ModelId, Request, Response, WireFormat};
+use switchyard_llm_client::{
+    ClientRouter, OpenAiPassthroughRequest, RunObserver, TranslatingLlmClient,
+};
+use switchyard_protocol::{LlmClientError, Metadata, ModelId, Request, Response, WireFormat};
 use thiserror::Error;
 
 use crate::DecisionTarget;
@@ -63,6 +65,11 @@ pub struct CountTokensTarget {
     pub client: Arc<TranslatingLlmClient>,
 }
 
+pub(crate) struct ResponsesTarget {
+    pub(crate) model: ModelId,
+    pub(crate) client: Arc<TranslatingLlmClient>,
+}
+
 /// Error returned while loading or executing configured routes.
 #[derive(Debug, Error)]
 pub enum RunnerError {
@@ -78,6 +85,8 @@ pub enum RunnerError {
     IncompatibleCallerFormat(CallerAuthKind),
     #[error("route has no Anthropic target for token counting")]
     CountTokensUnsupported,
+    #[error("no OpenAI Responses target is available for auxiliary endpoints")]
+    ResponsesPassthroughUnsupported,
     #[error(transparent)]
     Algorithm(#[from] LibsyError),
     #[error(transparent)]
@@ -113,6 +122,7 @@ pub struct Route {
     caller_auth: Option<CallerAuthKind>,
     capabilities: ModelCapabilities,
     count_tokens_target: Option<CountTokensTarget>,
+    responses_target: Option<ResponsesTarget>,
     decision_targets: Vec<DecisionTarget>,
 }
 
@@ -138,8 +148,18 @@ impl Route {
             caller_auth,
             capabilities,
             count_tokens_target,
+            responses_target: None,
             decision_targets,
         }
+    }
+
+    pub(crate) fn with_responses_target(mut self, target: Option<ResponsesTarget>) -> Self {
+        self.responses_target = target;
+        self
+    }
+
+    pub(crate) fn supports_responses_passthrough(&self) -> bool {
+        self.responses_target.is_some()
     }
 
     /// Returns the configured libsy algorithm name.
@@ -212,6 +232,23 @@ impl Route {
         target
             .client
             .count_tokens(&target.model, request)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Proxies an auxiliary OpenAI request through this route's Responses-capable target.
+    pub async fn passthrough_openai(
+        &self,
+        request: OpenAiPassthroughRequest,
+        metadata: Metadata,
+    ) -> Result<reqwest::Response, RunnerError> {
+        let target = self
+            .responses_target
+            .as_ref()
+            .ok_or(RunnerError::ResponsesPassthroughUnsupported)?;
+        target
+            .client
+            .passthrough_openai(&target.model, request, Some(&metadata))
             .await
             .map_err(Into::into)
     }

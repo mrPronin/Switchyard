@@ -8,7 +8,8 @@ use std::path::Path;
 
 use libsy::RoutingOutcome;
 use serde_json::Value;
-use switchyard_protocol::{ModelId, WireFormat};
+use switchyard_llm_client::OpenAiPassthroughRequest;
+use switchyard_protocol::{Metadata, ModelId, WireFormat};
 
 use crate::config;
 use crate::{ModelCapabilities, Route, RunnerError};
@@ -75,6 +76,21 @@ impl Runner {
             algorithm: route.algorithm_name(),
             capabilities: route.capabilities(),
         })
+    }
+
+    /// Proxies an auxiliary OpenAI request through the first Responses-capable route.
+    pub async fn passthrough_openai(
+        &self,
+        request: OpenAiPassthroughRequest,
+        metadata: Metadata,
+    ) -> Result<reqwest::Response, RunnerError> {
+        let route = self
+            .routes
+            .iter()
+            .map(|(_, route)| route)
+            .find(|route| route.supports_responses_passthrough())
+            .ok_or(RunnerError::ResponsesPassthroughUnsupported)?;
+        route.passthrough_openai(request, metadata).await
     }
 
     /// Resolves an outcome to configured target names and non-secret client settings.

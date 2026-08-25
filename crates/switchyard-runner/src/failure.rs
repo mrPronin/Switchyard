@@ -100,7 +100,8 @@ impl RunnerError {
             ),
             Self::UnknownRouteModel(_)
             | Self::IncompatibleCallerFormat(_)
-            | Self::CountTokensUnsupported => summary(
+            | Self::CountTokensUnsupported
+            | Self::ResponsesPassthroughUnsupported => summary(
                 RouteErrorKind::InvalidRequest,
                 RouteErrorPhase::BeforeResponse,
                 None,
