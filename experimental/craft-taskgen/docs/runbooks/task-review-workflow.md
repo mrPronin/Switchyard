@@ -36,7 +36,7 @@ as a sibling of craft-taskgen:
 
 ```bash
 # from craft-taskgen's parent dir
-git clone git@gitlab-master.nvidia.com:12051/aire/agents/craft-bench.git
+git clone <craft-bench-repo-url>
 ```
 
 ### 3. Check out and install harbor-lab
@@ -46,7 +46,7 @@ errors`, `tool-sequence`, `edits`, etc.). Clone and install it once:
 
 ```bash
 # from craft-taskgen's parent dir
-git clone git@gitlab-master.nvidia.com:12051/aire/agents/harbor-lab.git
+git clone <harbor-lab-repo-url>
 cd harbor-lab
 pip install uv
 uv pip install -e ".[dev]"

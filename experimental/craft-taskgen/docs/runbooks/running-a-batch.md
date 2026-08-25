@@ -15,7 +15,7 @@ every machine ⇒ shards never overlap.
 
    ```bash
    cd ~/projects   # or wherever you stage source trees
-   git clone git@gitlab-master.nvidia.com:aire/agents/craft-taskgen.git
+   git clone <craft-taskgen-repo-url>
    cd craft-taskgen
    git checkout dfarris/direct-api-refactor   # TODO: use `main` once MR 45 merges
    uv sync

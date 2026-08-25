@@ -34,8 +34,7 @@ test:
   script:
     - pytest tests/ -v
 
-# GitLab Pages — publish the static results site at site/ to
-# https://<group>.gitlab-master-pages.nvidia.com/<path>/craft-taskgen/.
+# GitLab Pages — publish the static results site at site/.
 # The job MUST be named `pages` and publish a `public/` directory; see
 # https://docs.gitlab.com/ee/user/project/pages/.
 pages:

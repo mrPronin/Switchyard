@@ -8,7 +8,7 @@ evaluation path. If you instead want to **generate new tasks**, read
 
 If you only need the headline numbers and don't want to reproduce them
 yourself, see
-[`craft-bench/planning/results.md`](https://gitlab-master.nvidia.com/aire/agents/craft-bench/-/blob/main/planning/results.md).
+`craft-bench/planning/results.md`.
 
 ## Prerequisites
 
@@ -28,8 +28,8 @@ the task suites.
 
 ```bash
 cd ~/projects   # or wherever you stage source trees
-git clone git@gitlab-master.nvidia.com:aire/agents/craft-taskgen.git
-git clone git@gitlab-master.nvidia.com:aire/agents/craft-bench.git
+git clone <craft-taskgen-repo-url>
+git clone <craft-bench-repo-url>
 cd craft-taskgen
 uv sync
 
@@ -201,8 +201,8 @@ harbor-lab metrics       baselines/<timestamp>/<task-id>/
 
 For full triage workflows (including the `harbor-f2p-p2p-deep-dive` skill
 and the per-test skip/keep judging path), see
-[`harbor-f2p-p2p-deep-dive` in this repo's
-`.claude/skills/`](https://gitlab-master.nvidia.com/aire/agents/craft-taskgen/-/tree/main/.claude/skills/harbor-f2p-p2p-deep-dive).
+`harbor-f2p-p2p-deep-dive` in this repo's
+`.claude/skills/`.
 
 ## 06 · Iterating
 
@@ -242,6 +242,6 @@ and the per-test skip/keep judging path), see
   evaluating an existing one.
 - [`task-review-workflow.md`](task-review-workflow.md) — how to handle
   `reviewer_concern_flag` / `easiness_flag` tasks after generation.
-- [`craft-bench/planning/results.md`](https://gitlab-master.nvidia.com/aire/agents/craft-bench/-/blob/main/planning/results.md)
+- `craft-bench/planning/results.md`
   — canonical CRAFT scores. Source of truth for the leaderboard on this
   site.

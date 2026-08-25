@@ -2180,8 +2180,7 @@ def _resolve_harbor_lab_bin() -> str:
             return pinned
 
     raise RuntimeError(
-        "harbor-lab binary not found. Install harbor-lab "
-        "(`git clone https://gitlab-master.nvidia.com/.../harbor-lab && uv sync`) "
+        "harbor-lab binary not found. Install harbor-lab (clone it and run `uv sync`) "
         "and either put its `.venv/bin/harbor-lab` on PATH or export HARBOR_LAB=<path>."
     )
 

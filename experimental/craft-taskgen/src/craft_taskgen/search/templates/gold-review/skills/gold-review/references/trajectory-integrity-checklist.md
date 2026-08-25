@@ -1,7 +1,6 @@
 # Trajectory Integrity Checklist
 
 Based on the agentic-benchmark-eval checklists (verifier_audit.md, task_design.md).
-Source: `ssh://git@gitlab-master.nvidia.com:12051/llm_evaluation_analsysis/agentic-benchmark-eval.git`
 
 ## Check 1: Gold Contamination
 

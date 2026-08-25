@@ -3,7 +3,7 @@
 > [!WARNING]
 > Experimental software. Not for production use.
 
-Generates task suites for the [CRAFT benchmark](https://gitlab-master.nvidia.com/aire/agents/craft-bench) along two dimensions:
+Generates task suites for the CRAFT benchmark along two dimensions:
 
 - **Tools** — tool-orchestration tasks mined from merged GitHub PRs (the production track that fed the v2b cohort)
 - **Search** — codebase-navigation tasks derived from implementation problems
@@ -12,8 +12,8 @@ Both pipelines evaluate with LLMs and validate with Docker. The Tools pipeline s
 
 ## Related repos
 
-- **[craft-bench](https://gitlab-master.nvidia.com/aire/agents/craft-bench)** — evaluation harness; consumes the suites produced here as `harbor-tasks/craft-taskgen-v2b/`, `harbor-tasks/craft-search-v2c/`, etc.
-- **[craft-paper](https://gitlab-master.nvidia.com/aire/agents/craft-paper)** — LaTeX source for the in-progress CRAFT paper.
+- **craft-bench** — evaluation harness; consumes the suites produced here as `harbor-tasks/craft-taskgen-v2b/`, `harbor-tasks/craft-search-v2c/`, etc.
+- **craft-paper** — LaTeX source for the in-progress CRAFT paper.
 - **[Working Google Doc](https://docs.google.com/document/d/1GR8aWHa4lUqrugllgBvUzDRd6EtOaqUym-ExHbbgj6k/edit)** — live planning surface for open questions and weekly notes.
 
 ## Where to start
@@ -32,12 +32,12 @@ Three entry paths cover almost all use:
 - [gh](https://cli.github.com/) (GitHub CLI) for candidate mining — `brew install gh && gh auth login`
 - Docker for task validation
 - Harbor (optional) for oracle and agent smoke testing
-- **harbor-lab** (required by triage) — Deep-dive triage shells out to `harbor-lab errors / edits / tool-sequence / metrics` on each Harbor trial. Install from https://gitlab-master.nvidia.com/.../harbor-lab (clone + `uv sync`). Put `.venv/bin/harbor-lab` on PATH or export `HARBOR_LAB=<path>`. Verify with `craft-taskgen-preflight`.
+- **harbor-lab** (required by triage) — Deep-dive triage shells out to `harbor-lab errors / edits / tool-sequence / metrics` on each Harbor trial. Install from the harbor-lab repo (clone + `uv sync`). Put `.venv/bin/harbor-lab` on PATH or export `HARBOR_LAB=<path>`. Verify with `craft-taskgen-preflight`.
 - **`repos/{owner}/{repo}/`** — a local clone of each target repo must exist before running the pipeline. The `select` and `evaluate` steps read the repo to show the diff to the LLM, so the clone is required from the very first step regardless of which step you resume from. Clone with:
   ```bash
   git clone https://github.com/{owner}/{repo} repos/{repo}
   ```
-- **[craft-bench](https://gitlab-master.nvidia.com/aire/agents/craft-bench) sibling checkout** — required by the Search pipeline (`--craft-bench-dir`). Clone alongside this repo (e.g. `~/projects/craft-bench/`).
+- **craft-bench sibling checkout** — required by the Search pipeline (`--craft-bench-dir`). Clone alongside this repo (e.g. `~/projects/craft-bench/`).
 
 ## Gateway-only LLM routing
 
@@ -485,7 +485,7 @@ For the reasoning-effort matrix and the version-pin rationale (Claude Code 2.1.1
 
 ### Published results
 
-Live results are surfaced on the internal site at `https://aire.gitlab-master-pages.nvidia.com/agents/craft-taskgen/`:
+Live results are surfaced on the internal GitLab Pages site:
 
 - **Leaderboard** — K=5 End-to-End numbers with CIs (claude-code, codex, opencode + a few model picks).
 - **Planner × Implementer matrix** — K=1, n=92, lift in pp vs no-plan baseline.
@@ -493,7 +493,7 @@ Live results are surfaced on the internal site at `https://aire.gitlab-master-pa
 
 ## Search Pipeline
 
-Derives codebase-navigation tasks from implementation problems via 3-model LLM synthesis. Requires a sibling [craft-bench](https://gitlab-master.nvidia.com/aire/agents/craft-bench) checkout — pass via `--craft-bench-dir`.
+Derives codebase-navigation tasks from implementation problems via 3-model LLM synthesis. Requires a sibling craft-bench checkout — pass via `--craft-bench-dir`.
 
 ```bash
 craft-taskgen \
