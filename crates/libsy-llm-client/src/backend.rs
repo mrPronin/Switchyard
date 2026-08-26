@@ -255,22 +255,18 @@ impl Backend {
         self.config().max_retries
     }
 
-    /// Whether this backend speaks the Anthropic Messages wire format — the only
-    /// one with a `count_tokens` endpoint.
-    pub fn is_anthropic(&self) -> bool {
-        matches!(self, Backend::Anthropic(_))
-    }
-
-    /// The upstream `/v1/messages/count_tokens` URL, derived from the same base
-    /// URL join as [`url`](Self::url).
-    pub fn count_tokens_url(&self) -> String {
-        let base_url = self.config().base_url.trim_end_matches('/');
-        format!("{}/count_tokens", anthropic_url(base_url))
-    }
-
-    // Resolves an OpenAI endpoint from the same configured base URL as Responses calls.
-    pub(crate) fn openai_endpoint_url(&self, suffix: &str) -> String {
-        openai_url(self.config().base_url.trim_end_matches('/'), suffix)
+    // Keeps the configured API root while replacing the provider endpoint path.
+    pub(crate) fn passthrough_url(&self, path_and_query: &str) -> String {
+        let endpoint = self.url();
+        let api_root = match self {
+            Backend::OpenAiChat(_) => endpoint
+                .strip_suffix("/chat/completions")
+                .unwrap_or(&endpoint),
+            Backend::OpenAiResponses(_) => endpoint.strip_suffix("/responses").unwrap_or(&endpoint),
+            Backend::Anthropic(_) => endpoint.strip_suffix("/messages").unwrap_or(&endpoint),
+        };
+        let suffix = path_and_query.strip_prefix("/v1").unwrap_or(path_and_query);
+        format!("{}{suffix}", api_root.trim_end_matches('/'))
     }
 
     /// Whether an upstream 400 `body` looks like a context-window overflow for
@@ -397,31 +393,17 @@ mod tests {
     }
 
     #[test]
-    fn count_tokens_url_joins_every_base_url_shape() {
+    fn passthrough_url_preserves_api_root_and_query() {
         assert_eq!(
-            Backend::Anthropic(config("https://host")).count_tokens_url(),
-            "https://host/v1/messages/count_tokens"
+            Backend::Anthropic(config("https://host/v1/messages"))
+                .passthrough_url("/v1/messages/count_tokens?beta=true"),
+            "https://host/v1/messages/count_tokens?beta=true"
         );
         assert_eq!(
-            Backend::Anthropic(config("https://host/v1")).count_tokens_url(),
-            "https://host/v1/messages/count_tokens"
+            Backend::OpenAiResponses(config("https://host/custom/v1/responses"))
+                .passthrough_url("/v1/files"),
+            "https://host/custom/v1/files"
         );
-        assert_eq!(
-            Backend::Anthropic(config("https://host/v1/messages")).count_tokens_url(),
-            "https://host/v1/messages/count_tokens"
-        );
-        // Trailing slash is trimmed before the join.
-        assert_eq!(
-            Backend::Anthropic(config("https://host/v1/")).count_tokens_url(),
-            "https://host/v1/messages/count_tokens"
-        );
-    }
-
-    #[test]
-    fn only_anthropic_backend_is_anthropic() {
-        assert!(Backend::Anthropic(config("x")).is_anthropic());
-        assert!(!Backend::OpenAiChat(config("x")).is_anthropic());
-        assert!(!Backend::OpenAiResponses(config("x")).is_anthropic());
     }
 
     #[test]

@@ -10,8 +10,8 @@ use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use http::StatusCode;
-use reqwest::RequestBuilder;
-use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER};
+use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, RETRY_AFTER};
+use reqwest::{Method, RequestBuilder};
 use serde_json::{Map, Value};
 use switchyard_protocol::{
     LlmRequest, LlmResponse, Metadata, ModelId, Request, Response, RoutedLlmClient,
@@ -34,6 +34,11 @@ const RESERVED_HEADERS: &[&str] = &[
     "host",
     "content-length",
     "connection",
+    "keep-alive",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
     "authorization",
     "proxy-authorization",
     "proxy-authenticate",
@@ -94,29 +99,24 @@ pub struct TranslatingLlmClient {
     forward_auth_client: reqwest::Client,
 }
 
-/// Provider-native OpenAI request proxied without translation.
-pub enum OpenAiPassthroughRequest {
-    /// Count input tokens using `POST /v1/responses/input_tokens`.
-    ResponsesInputTokens(Value),
-    /// Compact conversation input using `POST /v1/responses/compact`.
-    ResponsesCompact(Value),
-    /// Upload multipart form data using `POST /v1/files`.
-    File {
-        /// Uninspected multipart request body.
-        body: reqwest::Body,
-        /// Multipart content type, including its boundary.
-        content_type: HeaderValue,
-    },
+/// Body of a provider-native request proxied without translation.
+pub enum PassthroughBody {
+    /// JSON that may contain a synthetic route model to rewrite.
+    Json(Value),
+    /// An uninspected streaming body, such as a multipart upload.
+    Streaming(reqwest::Body),
+    /// A request with no body.
+    Empty,
 }
 
-impl OpenAiPassthroughRequest {
-    const fn suffix(&self) -> &'static str {
-        match self {
-            Self::ResponsesInputTokens(_) => "/responses/input_tokens",
-            Self::ResponsesCompact(_) => "/responses/compact",
-            Self::File { .. } => "/files",
-        }
-    }
+/// Provider-native HTTP request proxied to a configured model backend.
+pub struct PassthroughRequest {
+    /// Original HTTP method.
+    pub method: Method,
+    /// Original path and optional query string.
+    pub path_and_query: String,
+    /// Untranslated request body.
+    pub body: PassthroughBody,
 }
 
 impl TranslatingLlmClient {
@@ -169,44 +169,34 @@ impl TranslatingLlmClient {
         })
     }
 
-    /// Whether `model` has an Anthropic backend that supports token counting.
-    pub fn supports_count_tokens(&self, model: &ModelId) -> bool {
-        self.backend_for(model, WireFormat::AnthropicMessages)
-            .is_some()
-    }
-
-    /// Proxies an auxiliary OpenAI request through `model`'s Responses backend.
+    /// Proxies a provider-native request through `model`'s matching backend.
     ///
-    /// Responses JSON remains provider-native except that `model` is replaced with
-    /// the configured upstream model id. File bodies and all responses remain uninspected.
-    pub async fn passthrough_openai(
+    /// JSON remains provider-native except that an existing `model` field is
+    /// replaced with the configured upstream model id. Other bodies and all
+    /// responses remain uninspected.
+    pub async fn passthrough(
         &self,
         model: &ModelId,
-        request: OpenAiPassthroughRequest,
+        format: WireFormat,
+        request: PassthroughRequest,
         metadata: Option<&Metadata>,
     ) -> Result<reqwest::Response> {
-        let backend = self
-            .backend_for(model, WireFormat::OpenAiResponses)
-            .ok_or_else(|| LlmClientError::Configuration {
-                message: format!("model {model} has no OpenAI Responses backend"),
-            })?;
-        let url = backend.openai_endpoint_url(request.suffix());
-        let builder = match request {
-            OpenAiPassthroughRequest::ResponsesInputTokens(mut body)
-            | OpenAiPassthroughRequest::ResponsesCompact(mut body) => {
-                if !body.is_object() {
-                    return Err(LlmClientError::InvalidRequest {
-                        message: "request body must be a JSON object".to_string(),
-                    });
+        let backend =
+            self.backend_for(model, format)
+                .ok_or_else(|| LlmClientError::Configuration {
+                    message: format!("model {model} has no {format} backend"),
+                })?;
+        let url = backend.passthrough_url(&request.path_and_query);
+        let builder = self.http_client(backend).request(request.method, url);
+        let builder = match request.body {
+            PassthroughBody::Json(mut body) => {
+                if body.get("model").is_some() {
+                    set_json_model(&mut body, model);
                 }
-                set_json_model(&mut body, model);
-                self.http_client(backend).post(url).json(&body)
+                builder.json(&body)
             }
-            OpenAiPassthroughRequest::File { body, content_type } => self
-                .http_client(backend)
-                .post(url)
-                .header(CONTENT_TYPE, content_type)
-                .body(body),
+            PassthroughBody::Streaming(body) => apply_entity_headers(builder.body(body), metadata),
+            PassthroughBody::Empty => builder,
         };
         let builder = forward_metadata_headers(builder, metadata);
         let builder = backend.apply_forwarded_auth(builder, metadata);
@@ -231,56 +221,13 @@ impl TranslatingLlmClient {
         }
     }
 
-    /// Counts input tokens with `model`'s Anthropic backend.
-    ///
-    /// Returns an error when the model has no Anthropic backend or the upstream
-    /// request fails or returns invalid JSON.
-    pub async fn count_tokens(&self, model: &ModelId, request: Request) -> Result<Value> {
-        let backend = self
-            .backend_for(model, WireFormat::AnthropicMessages)
-            .ok_or_else(|| LlmClientError::Configuration {
-                message: format!("model {model} has no Anthropic backend for count_tokens"),
-            })?;
-        let Request {
-            mut llm_request,
-            metadata,
-            ..
-        } = request;
-        llm_request.model = Some(model.to_string());
-        let http_response = self
-            .send_encoded(
-                backend,
-                WireFormat::AnthropicMessages,
-                llm_request,
-                metadata.as_ref(),
-                model,
-                UpstreamEndpoint::CountTokens,
-            )
-            .await?;
-        let body = match http_response {
-            EncodedResponse::Buffered { body, .. } => body,
-            EncodedResponse::Streaming(_) => {
-                return Err(LlmClientError::InvalidRequest {
-                    message: "count_tokens does not support streaming requests".to_string(),
-                });
-            }
-        };
-        serde_json::from_slice(&body).map_err(|error| LlmClientError::InvalidResponse {
-            source: Box::new(error),
-        })
-    }
-
     /// Encode `llm_request` for `wire_format`, POST it to `url` with the request's
     /// forwarded headers plus the backend's static headers and auth, and return the
     /// successful upstream response. A
     /// buffered response is fully collected within the retry boundary; a streamed
     /// response is returned as soon as its successful headers arrive. A non-success
     /// status maps to a typed error — a 400 is classified as a context-window
-    /// overflow via the backend's provider rules. Shared by
-    /// [`call_rewrite_model`](Self::call_rewrite_model) (which POSTs to the
-    /// backend's completion URL and decodes a response) and
-    /// [`count_tokens`](Self::count_tokens) (which POSTs to the `count_tokens`
-    /// URL and returns the raw JSON).
+    /// overflow via the backend's provider rules.
     async fn send_encoded(
         &self,
         backend: &Backend,
@@ -288,7 +235,6 @@ impl TranslatingLlmClient {
         llm_request: LlmRequest,
         metadata: Option<&Metadata>,
         model: &ModelId,
-        endpoint: UpstreamEndpoint,
     ) -> Result<EncodedResponse> {
         let mut body = encode_request(&llm_request, wire_format)
             .map_err(|error| LlmClientError::RequestEncoding(error.to_string()))?;
@@ -309,9 +255,8 @@ impl TranslatingLlmClient {
         if matches!(backend, Backend::OpenAiChat(_)) {
             ensure_openai_stream_usage(&mut body);
         }
-        let streaming = endpoint.allows_streaming()
-            && body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-        let url = endpoint.url(backend);
+        let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+        let url = backend.url();
         record_gen_ai_request(&url, model, streaming);
 
         let max_retries = u64::from(backend.max_retries());
@@ -501,7 +446,6 @@ impl TranslatingLlmClient {
                 llm_request,
                 metadata.as_ref(),
                 &model_id,
-                UpstreamEndpoint::Completion,
             )
             .await?;
 
@@ -619,25 +563,6 @@ impl RoutedLlmClient for TranslatingLlmClient {
     }
 }
 
-#[derive(Clone, Copy)]
-enum UpstreamEndpoint {
-    Completion,
-    CountTokens,
-}
-
-impl UpstreamEndpoint {
-    fn url(self, backend: &Backend) -> String {
-        match self {
-            UpstreamEndpoint::Completion => backend.url(),
-            UpstreamEndpoint::CountTokens => backend.count_tokens_url(),
-        }
-    }
-
-    fn allows_streaming(self) -> bool {
-        matches!(self, UpstreamEndpoint::Completion)
-    }
-}
-
 enum EncodedResponse {
     Buffered { status: u16, body: Vec<u8> },
     Streaming(reqwest::Response),
@@ -747,6 +672,22 @@ fn forward_metadata_headers(
             continue;
         }
         builder = builder.header(name, value);
+    }
+    builder
+}
+
+// Preserves framing headers for uninspected request bodies.
+fn apply_entity_headers(
+    mut builder: RequestBuilder,
+    metadata: Option<&Metadata>,
+) -> RequestBuilder {
+    let Some(headers) = metadata.and_then(|metadata| metadata.http_headers.as_ref()) else {
+        return builder;
+    };
+    for name in [CONTENT_TYPE, CONTENT_LENGTH] {
+        if let Some(value) = headers.get(&name) {
+            builder = builder.header(name, value);
+        }
     }
     builder
 }

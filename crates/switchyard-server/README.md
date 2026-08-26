@@ -129,7 +129,8 @@ documented in [Stage-Router Routing](../../docs/routing_algorithms/stage_router_
 | `POST` | `/v1/messages` | Anthropic Messages |
 | `POST` | `/v1/responses` | OpenAI Responses |
 | `POST` | `/v1/decision` | Resolve selected and fallback targets without a post-routing answer call |
-| `POST` | `/v1/messages/count_tokens` | Token count from a route's Anthropic target |
+| `POST` | `/v1/messages/count_tokens` | Raw token-count proxy to a route's Anthropic target |
+| Any | Any otherwise unmatched path | Raw proxy to the first compatible route target |
 | `GET` | `/v1/models` | Routes served by this deployment |
 | `GET` | `/v1/stats` | Per-model usage plus curated algorithm stats |
 | `POST` | `/v1/stats/reset` | Clear accumulated stats |

@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::body::Body;
+use axum::body::{Body, HttpBody, to_bytes};
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Query, Request as HttpRequest, State};
 use axum::http::header::CONTENT_TYPE;
@@ -37,7 +37,9 @@ use libsy::{Algorithm, LibsyError, RoutingOutcome};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use switchyard_llm_client::{ClientRouter, OpenAiPassthroughRequest, RunObservation, RunObserver};
+use switchyard_llm_client::{
+    ClientRouter, PassthroughBody, PassthroughRequest, RunObservation, RunObserver,
+};
 use switchyard_protocol::{LlmClientError, Metadata, ModelId, Request, Usage};
 use switchyard_runner::{
     CallerAuthKind, DecisionTarget, ModelCapabilities, Route, RunOutput, Runner, RunnerError,
@@ -187,7 +189,6 @@ impl ServerState {
                         clients,
                         None,
                         ModelCapabilities::default(),
-                        None,
                         Vec::new(),
                     ),
                 )
@@ -475,14 +476,7 @@ pub fn build_switchyard_router(state: ServerState) -> Router {
         .route("/v1/chat/completions", post(openai_chat_completions))
         .route("/v1/messages", post(anthropic_messages))
         .route("/v1/responses", post(openai_responses))
-        .route(
-            "/v1/responses/input_tokens",
-            post(openai_responses_input_tokens),
-        )
-        .route("/v1/responses/compact", post(openai_responses_compact))
-        .route("/v1/files", post(openai_files))
         .route("/v1/decision", post(decision))
-        .route("/v1/messages/count_tokens", post(anthropic_count_tokens))
         .route("/v1/models", get(models))
         .route("/v1/stats", get(get_stats))
         .route("/v1/stats/reset", post(reset_stats))
@@ -492,7 +486,7 @@ pub fn build_switchyard_router(state: ServerState) -> Router {
         router = router.route("/v1/routing/session-stats", get(get_session_stats));
     }
     router
-        .fallback(not_found)
+        .fallback(proxy_unmatched)
         .layer(DefaultBodyLimit::max(DEFAULT_MAX_REQUEST_BODY_BYTES))
         // `layer` only wraps routes registered before it, so this stays last.
         .layer(axum::middleware::from_fn(stamp_request_start))
@@ -543,78 +537,107 @@ async fn openai_responses(
     handle_endpoint(state, started, headers, body, WireFormat::OpenAiResponses).await
 }
 
-async fn openai_responses_input_tokens(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    body: std::result::Result<Json<Value>, JsonRejection>,
-) -> Response {
-    passthrough_responses_json(
-        state,
-        headers,
-        body,
-        OpenAiPassthroughRequest::ResponsesInputTokens,
-    )
-    .await
+// Unmatched provider paths bypass translation but still use configured target auth.
+async fn proxy_unmatched(State(state): State<ServerState>, request: HttpRequest) -> Response {
+    let wire_format = passthrough_wire_format(request.uri().path());
+    let response = proxy_unmatched_inner(state, request, wire_format).await;
+    render_error_response(response, wire_format)
 }
 
-async fn openai_responses_compact(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    body: std::result::Result<Json<Value>, JsonRejection>,
-) -> Response {
-    passthrough_responses_json(
-        state,
-        headers,
-        body,
-        OpenAiPassthroughRequest::ResponsesCompact,
-    )
-    .await
-}
-
-async fn passthrough_responses_json(
+async fn proxy_unmatched_inner(
     state: ServerState,
-    headers: HeaderMap,
-    body: std::result::Result<Json<Value>, JsonRejection>,
-    request: fn(Value) -> OpenAiPassthroughRequest,
+    request: HttpRequest,
+    wire_format: WireFormat,
 ) -> Response {
-    let body = match llm_json_body(body) {
-        Ok(body) => body,
-        Err((status, message)) => return invalid_body_error(status, message),
-    };
-    let route = match resolve_requested_route(
-        &state,
-        body.get("model").and_then(Value::as_str),
-        WireFormat::OpenAiResponses,
-    ) {
-        Ok(route) => route,
-        Err(response) => return response,
-    };
-    match route
-        .passthrough_openai(request(body), metadata_from_headers(headers))
-        .await
-    {
-        Ok(response) => passthrough_response(response),
-        Err(error) => runner_error(error),
-    }
-}
-
-async fn openai_files(State(state): State<ServerState>, request: HttpRequest) -> Response {
     let (parts, body) = request.into_parts();
-    let Some(content_type) = parts.headers.get(CONTENT_TYPE).cloned() else {
-        return invalid_body_error(
-            StatusCode::BAD_REQUEST,
-            "request must include a Content-Type header",
-        );
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .map_or_else(|| parts.uri.path().to_string(), ToString::to_string);
+    let is_json = is_json_content_type(&parts.headers);
+    let no_body = body.size_hint().exact() == Some(0);
+    let (body, requested_model) = if no_body {
+        (PassthroughBody::Empty, None)
+    } else if is_json {
+        let bytes = match to_bytes(body, DEFAULT_MAX_REQUEST_BODY_BYTES).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return invalid_body_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!("failed to read request body: {error}"),
+                );
+            }
+        };
+        let value: Value = match serde_json::from_slice(&bytes) {
+            Ok(value) => value,
+            Err(error) => {
+                return invalid_body_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("Request body must be valid JSON: {error}"),
+                );
+            }
+        };
+        let model = match value.get("model") {
+            Some(Value::String(model)) => Some(model.clone()),
+            Some(_) => {
+                return invalid_body_error(
+                    StatusCode::BAD_REQUEST,
+                    "request body `model` must be a string",
+                );
+            }
+            None => None,
+        };
+        (PassthroughBody::Json(value), model)
+    } else {
+        (
+            PassthroughBody::Streaming(reqwest::Body::wrap_stream(body.into_data_stream())),
+            None,
+        )
     };
     let metadata = metadata_from_headers(parts.headers);
-    let request = OpenAiPassthroughRequest::File {
-        body: reqwest::Body::wrap_stream(body.into_data_stream()),
-        content_type,
+    let request = PassthroughRequest {
+        method: parts.method,
+        path_and_query,
+        body,
     };
-    match state.runner.passthrough_openai(request, metadata).await {
+    let result = match requested_model {
+        Some(model) => match resolve_requested_route(&state, Some(&model), wire_format) {
+            Ok(route) => route.passthrough(wire_format, request, metadata).await,
+            Err(response) => return response,
+        },
+        None => {
+            state
+                .runner
+                .passthrough(wire_format, request, metadata)
+                .await
+        }
+    };
+    match result {
         Ok(response) => passthrough_response(response),
         Err(error) => runner_error(error),
     }
+}
+
+fn passthrough_wire_format(path: &str) -> WireFormat {
+    if path.starts_with("/v1/messages/") {
+        WireFormat::AnthropicMessages
+    } else if path.starts_with("/v1/chat/") {
+        WireFormat::OpenAiChat
+    } else {
+        WireFormat::OpenAiResponses
+    }
+}
+
+fn is_json_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .is_some_and(|value| {
+            value.eq_ignore_ascii_case("application/json")
+                || value.to_ascii_lowercase().ends_with("+json")
+        })
 }
 
 fn passthrough_response(upstream: reqwest::Response) -> Response {
@@ -694,45 +717,6 @@ async fn decision(
             server_error("routing outcome contains a model with no callable target configuration")
         }
     }
-}
-
-/// Anthropic token counting against the route's explicitly configured target.
-async fn anthropic_count_tokens(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    body: std::result::Result<Json<Value>, JsonRejection>,
-) -> Response {
-    let body = match llm_json_body(body) {
-        Ok(body) => body,
-        Err((status, message)) => {
-            return anthropic_error_response(invalid_body_error(status, message));
-        }
-    };
-    let (route, request) = match resolve_route(
-        &state,
-        metadata_from_headers(headers),
-        body,
-        WireFormat::AnthropicMessages,
-    ) {
-        Ok(resolved) => resolved,
-        Err(response) => return anthropic_error_response(response),
-    };
-    anthropic_error_response(match route.count_tokens(request).await {
-        Ok(payload) => (StatusCode::OK, Json(payload)).into_response(),
-        Err(RunnerError::CountTokensUnsupported) => error_response(
-            StatusCode::BAD_REQUEST,
-            "route has no Anthropic target for token counting",
-            "invalid_request_error",
-            "count_tokens_unsupported",
-        ),
-        Err(RunnerError::Client(error)) => count_tokens_error(error),
-        Err(error) => server_error(error.to_string()),
-    })
-}
-
-/// Maps a token-count client failure with the same policy as a routed client call.
-fn count_tokens_error(error: LlmClientError) -> Response {
-    client_error(&error)
 }
 
 async fn handle_endpoint(
@@ -816,7 +800,7 @@ fn llm_json_body(
 }
 
 /// Decode `body`, resolve the route named by its `model`, and build the
-/// [`Request`]. Shared by the completion and `count_tokens` handlers. Returns
+/// [`Request`]. Returns
 /// the resolved route and the built request — or an error [`Response`]
 /// (invalid body, empty `model` → 400, unknown route → 404).
 // Both callers immediately return the `Err(Response)` as the HTTP response, so
@@ -1044,11 +1028,11 @@ fn runner_error(error: RunnerError) -> Response {
     match error {
         RunnerError::Algorithm(error) => algorithm_error(error),
         RunnerError::Client(error) => client_error(&error),
-        RunnerError::ResponsesPassthroughUnsupported => error_response(
+        RunnerError::PassthroughUnsupported(_) => error_response(
             StatusCode::BAD_REQUEST,
             error.to_string(),
             "invalid_request_error",
-            "responses_target_unavailable",
+            "passthrough_target_unavailable",
         ),
         error => server_error(error.to_string()),
     }
@@ -1174,10 +1158,6 @@ fn render_error_response(response: Response, wire_format: WireFormat) -> Respons
         return response;
     };
     error.into_response(wire_format)
-}
-
-fn anthropic_error_response(response: Response) -> Response {
-    render_error_response(response, WireFormat::AnthropicMessages)
 }
 
 fn anthropic_error_type(status: StatusCode) -> &'static str {
@@ -1497,10 +1477,7 @@ fn endpoint_listing(has_routing_log: bool) -> String {
         "  POST /v1/chat/completions    OpenAI Chat Completions",
         "  POST /v1/messages            Anthropic Messages",
         "  POST /v1/responses           OpenAI Responses",
-        "  POST /v1/responses/input_tokens",
-        "  POST /v1/responses/compact",
-        "  POST /v1/files",
-        "  POST /v1/messages/count_tokens",
+        "  ANY  other paths             provider passthrough",
         "  GET  /v1/models              configured routes",
         "  GET  /v1/stats               routing stats",
         "  POST /v1/stats/reset",

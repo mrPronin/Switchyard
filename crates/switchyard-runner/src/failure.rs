@@ -100,8 +100,7 @@ impl RunnerError {
             ),
             Self::UnknownRouteModel(_)
             | Self::IncompatibleCallerFormat(_)
-            | Self::CountTokensUnsupported
-            | Self::ResponsesPassthroughUnsupported => summary(
+            | Self::PassthroughUnsupported(_) => summary(
                 RouteErrorKind::InvalidRequest,
                 RouteErrorPhase::BeforeResponse,
                 None,
@@ -176,6 +175,7 @@ fn summary(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use switchyard_protocol::WireFormat;
 
     const SECRET: &str = "patient name is Jane Doe";
 
@@ -330,7 +330,7 @@ mod tests {
             RouteErrorKind::Configuration
         ));
 
-        let unsupported = RunnerError::CountTokensUnsupported;
+        let unsupported = RunnerError::PassthroughUnsupported(WireFormat::AnthropicMessages);
         assert!(matches!(
             unsupported.execution_error_summary().kind,
             RouteErrorKind::InvalidRequest

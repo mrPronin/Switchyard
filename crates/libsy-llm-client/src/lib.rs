@@ -26,7 +26,7 @@ pub mod raw;
 pub mod run;
 
 pub use backend::{Backend, DEFAULT_MAX_RETRIES, HttpBackendConfig};
-pub use client::{ModelConfig, OpenAiPassthroughRequest, TranslatingLlmClient};
+pub use client::{ModelConfig, PassthroughBody, PassthroughRequest, TranslatingLlmClient};
 pub use error::{LlmClientError, Result};
 pub use observation::{LlmCallObservation, RunObservation, RunObserver};
 pub use raw::RawResponse;

@@ -524,7 +524,7 @@ async fn stats_exposes_the_exact_empty_schema_and_no_legacy_alias() -> TestResul
     );
     assert_eq!(
         send(&app, "GET", "/v1/routing/stats", None).await?.status,
-        StatusCode::NOT_FOUND
+        StatusCode::BAD_REQUEST
     );
     Ok(())
 }
@@ -1713,7 +1713,7 @@ response_format_type = "json_object"
 }
 
 #[tokio::test]
-async fn count_tokens_forwards_to_configured_anthropic_target() -> TestResult {
+async fn count_tokens_forwards_to_first_anthropic_routing_target() -> TestResult {
     let upstream = MockUpstream::start().await?;
     let state = load_test_config(&format!(
         r#"
@@ -1756,7 +1756,7 @@ targets = ["other", "strong"]
     let calls = upstream.calls.lock().await;
     assert_eq!(calls.len(), 1);
     // The inbound route name is rewritten to the real upstream model.
-    assert_eq!(calls[0]["model"], "real/opus");
+    assert_eq!(calls[0]["model"], "real/sonnet");
     Ok(())
 }
 
@@ -1938,7 +1938,7 @@ targets = ["weak"]
             "type": "error",
             "error": {
                 "type": "invalid_request_error",
-                "message": "route has no Anthropic target for token counting"
+                "message": "route has no target compatible with anthropic_messages for passthrough"
             }
         })
     );
@@ -1965,8 +1965,11 @@ async fn routes_dispatch_and_discovery_endpoints_are_stable() -> TestResult {
     );
 
     let missing = send(&app, "GET", "/missing", None).await?;
-    assert_eq!(missing.status, StatusCode::NOT_FOUND);
-    assert_eq!(missing.json()?["error"]["code"], "endpoint_not_found");
+    assert_eq!(missing.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        missing.json()?["error"]["code"],
+        "passthrough_target_unavailable"
+    );
 
     for (route_model, target_model) in [
         ("switchyard/general", "model/general"),

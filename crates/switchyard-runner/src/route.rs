@@ -7,10 +7,7 @@ use std::error::Error;
 use std::sync::Arc;
 
 use libsy::{Algorithm, CallModel, LibsyError, RoutingOutcome, drive};
-use serde_json::Value;
-use switchyard_llm_client::{
-    ClientRouter, OpenAiPassthroughRequest, RunObserver, TranslatingLlmClient,
-};
+use switchyard_llm_client::{ClientRouter, PassthroughRequest, RunObserver, TranslatingLlmClient};
 use switchyard_protocol::{LlmClientError, Metadata, ModelId, Request, Response, WireFormat};
 use thiserror::Error;
 
@@ -58,14 +55,8 @@ impl CallerAuthKind {
     }
 }
 
-/// Exact upstream model used for Anthropic token counting.
 #[derive(Clone)]
-pub struct CountTokensTarget {
-    pub model: ModelId,
-    pub client: Arc<TranslatingLlmClient>,
-}
-
-pub(crate) struct ResponsesTarget {
+pub(crate) struct PassthroughTarget {
     pub(crate) model: ModelId,
     pub(crate) client: Arc<TranslatingLlmClient>,
 }
@@ -83,10 +74,8 @@ pub enum RunnerError {
     UnknownRouteModel(String),
     #[error("caller format is incompatible with {} credentials", .0.as_str())]
     IncompatibleCallerFormat(CallerAuthKind),
-    #[error("route has no Anthropic target for token counting")]
-    CountTokensUnsupported,
-    #[error("no OpenAI Responses target is available for auxiliary endpoints")]
-    ResponsesPassthroughUnsupported,
+    #[error("route has no target compatible with {0} for passthrough")]
+    PassthroughUnsupported(WireFormat),
     #[error(transparent)]
     Algorithm(#[from] LibsyError),
     #[error(transparent)]
@@ -121,8 +110,7 @@ pub struct Route {
     clients: ClientRouter,
     caller_auth: Option<CallerAuthKind>,
     capabilities: ModelCapabilities,
-    count_tokens_target: Option<CountTokensTarget>,
-    responses_target: Option<ResponsesTarget>,
+    passthrough_targets: Vec<PassthroughTarget>,
     decision_targets: Vec<DecisionTarget>,
 }
 
@@ -139,7 +127,6 @@ impl Route {
         clients: ClientRouter,
         caller_auth: Option<CallerAuthKind>,
         capabilities: ModelCapabilities,
-        count_tokens_target: Option<CountTokensTarget>,
         decision_targets: Vec<DecisionTarget>,
     ) -> Self {
         Self {
@@ -147,19 +134,18 @@ impl Route {
             clients,
             caller_auth,
             capabilities,
-            count_tokens_target,
-            responses_target: None,
+            passthrough_targets: Vec::new(),
             decision_targets,
         }
     }
 
-    pub(crate) fn with_responses_target(mut self, target: Option<ResponsesTarget>) -> Self {
-        self.responses_target = target;
+    pub(crate) fn with_passthrough_targets(mut self, targets: Vec<PassthroughTarget>) -> Self {
+        self.passthrough_targets = targets;
         self
     }
 
-    pub(crate) fn supports_responses_passthrough(&self) -> bool {
-        self.responses_target.is_some()
+    pub(crate) fn supports_passthrough(&self, format: WireFormat) -> bool {
+        self.passthrough_target(format).is_some()
     }
 
     /// Returns the configured libsy algorithm name.
@@ -223,34 +209,43 @@ impl Route {
         .map_err(Into::into)
     }
 
-    /// Counts tokens using the configured Anthropic-capable target.
-    pub async fn count_tokens(&self, request: Request) -> Result<Value, RunnerError> {
-        let target = self
-            .count_tokens_target
-            .as_ref()
-            .ok_or(RunnerError::CountTokensUnsupported)?;
+    /// Proxies a provider-native request through this route's first compatible target.
+    pub async fn passthrough(
+        &self,
+        format: WireFormat,
+        request: PassthroughRequest,
+        metadata: Metadata,
+    ) -> Result<reqwest::Response, RunnerError> {
+        let (target, target_format) = self
+            .passthrough_target(format)
+            .ok_or(RunnerError::PassthroughUnsupported(format))?;
         target
             .client
-            .count_tokens(&target.model, request)
+            .passthrough(&target.model, target_format, request, Some(&metadata))
             .await
             .map_err(Into::into)
     }
 
-    /// Proxies an auxiliary OpenAI request through this route's Responses-capable target.
-    pub async fn passthrough_openai(
+    fn passthrough_target(
         &self,
-        request: OpenAiPassthroughRequest,
-        metadata: Metadata,
-    ) -> Result<reqwest::Response, RunnerError> {
-        let target = self
-            .responses_target
-            .as_ref()
-            .ok_or(RunnerError::ResponsesPassthroughUnsupported)?;
-        target
-            .client
-            .passthrough_openai(&target.model, request, Some(&metadata))
-            .await
-            .map_err(Into::into)
+        preferred_format: WireFormat,
+    ) -> Option<(&PassthroughTarget, WireFormat)> {
+        passthrough_formats(preferred_format)
+            .iter()
+            .find_map(|format| {
+                self.passthrough_targets
+                    .iter()
+                    .find(|target| target.client.backend_for(&target.model, *format).is_some())
+                    .map(|target| (target, *format))
+            })
+    }
+}
+
+fn passthrough_formats(preferred: WireFormat) -> &'static [WireFormat] {
+    match preferred {
+        WireFormat::OpenAiResponses => &[WireFormat::OpenAiResponses, WireFormat::OpenAiChat],
+        WireFormat::OpenAiChat => &[WireFormat::OpenAiChat, WireFormat::OpenAiResponses],
+        WireFormat::AnthropicMessages => &[WireFormat::AnthropicMessages],
     }
 }
 
