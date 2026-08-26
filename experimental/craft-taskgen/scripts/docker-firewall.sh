@@ -5,8 +5,8 @@
 # Allowlists only the hosts needed to run the inference + agent install paths
 # the v2b cohort uses. Blocks all other outbound traffic from containers.
 #
-# Forked from harbor-datasets MR23 `tools/docker-firewall.sh` to extend the
-# allowlist for npm registry (Alpine claude-code install). The MR23 original
+# Forked from harbor-datasets' `tools/docker-firewall.sh` to extend the
+# allowlist for npm registry (Alpine claude-code install). The original
 # is otherwise unchanged.
 #
 # Usage:
@@ -57,9 +57,15 @@ set -euo pipefail
 DOCKER_SUBNET="172.16.0.0/12"
 DOCKER_HOST="172.17.0.1"
 
+# The inference gateway is deployment-specific — derive its host from
+# OPENAI_BASE_URL (e.g. https://gateway.example.com/v1) so no endpoint is
+# hardcoded in the allowlist.
+INFERENCE_BASE_URL="${OPENAI_BASE_URL:?OPENAI_BASE_URL required (inference gateway base URL)}"
+INFERENCE_HOST="$(printf '%s' "$INFERENCE_BASE_URL" | sed -E 's#^[a-z]+://##; s#[:/].*$##')"
+
 # Hosts the container needs to reach
 ALLOWED_HOSTS=(
-    "inference-api.nvidia.com"     # Inference gateway (codex / opencode / claude-code)
+    "$INFERENCE_HOST"              # Inference gateway (codex / opencode / claude-code)
     "api.anthropic.com"            # Claude CLI may phone home
     "claude.ai"                    # claude-code installer entry (curl install.sh)
     "downloads.claude.ai"          # claude-code installer follow-up (binary download host)
@@ -68,7 +74,7 @@ ALLOWED_HOSTS=(
 )
 
 # Local services on Docker host (none for craft-bench currently;
-# kept commented for parity with MR23 and easy reactivation)
+# kept commented for parity with the upstream script and easy reactivation)
 ALLOWED_HOST_PORTS=()
 
 resolve_ips() {
@@ -154,19 +160,22 @@ run_test() {
     echo "Testing from a Docker container..."
     echo ""
 
-    # Test allowed: inference API
-    echo -n "Inference API (https://inference-api.nvidia.com): "
-    docker run --rm python:3.12-slim python3 -c "
+    # Test allowed: inference API. The URL goes through an env var (single-quoted
+    # -c, no shell interpolation) so it cannot break out of the Python string
+    # literal and inject code (CWE-78) — same pattern as resolve_ips above.
+    echo -n "Inference API (https://$INFERENCE_HOST): "
+    docker run --rm -e PROBE_URL="https://$INFERENCE_HOST/" python:3.12-slim python3 -c '
+import os
 from urllib.request import urlopen
 try:
-    r = urlopen('https://inference-api.nvidia.com/', timeout=5)
-    print(f'OK (status {r.status})')
+    r = urlopen(os.environ["PROBE_URL"], timeout=5)
+    print(f"OK (status {r.status})")
 except Exception as e:
-    if 'timed out' in str(e) or 'Connection refused' in str(e):
-        print(f'FAIL: {e}')
+    if "timed out" in str(e) or "Connection refused" in str(e):
+        print(f"FAIL: {e}")
     else:
-        print(f'OK (got error but reachable: {type(e).__name__})')
-" 2>&1
+        print(f"OK (got error but reachable: {type(e).__name__})")
+' 2>&1
 
     # Test allowed: npm registry (codex install needs this)
     echo -n "npm registry (https://registry.npmjs.org): "

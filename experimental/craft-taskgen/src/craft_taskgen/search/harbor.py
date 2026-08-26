@@ -33,13 +33,26 @@ from craft_taskgen.search._harbor_utils import (
 # Templates
 # ---------------------------------------------------------------------------
 
+
 # Agent CLIs are pinned so reruns against a given task set always use the
 # same versions. Unversioned installs (plain `curl | bash` / `npm install -g`)
 # would silently drift to whatever was "latest" at image-build time, then
 # freeze under Docker layer caching so the "latest" at first-build lock-in
 # propagates to every subsequent search-track trial. Explicit pin makes the
 # CLI version an MR-level change, not a filesystem-mtime artifact.
-_AGENT_INSTALL_SNIPPET = f"""
+def _agent_install_snippet() -> str:
+    """Dockerfile tail installing the agent CLIs + codex gateway config.
+
+    The gateway base URL comes from `OPENAI_BASE_URL` at render time — no
+    endpoint is baked into the source.
+    """
+    base_url = os.environ.get("OPENAI_BASE_URL", "")
+    if not base_url:
+        raise RuntimeError(
+            "OPENAI_BASE_URL must be set — it is written into the task image's "
+            "codex config as the inference gateway base_url."
+        )
+    return f"""
 # --- Agent runtimes + NVIDIA gateway config (appended by harbor.py) ---
 RUN apt-get update && apt-get install -y --no-install-recommends curl && \\
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \\
@@ -54,7 +67,7 @@ RUN mkdir -p /etc/codex && cat > /etc/codex/config.toml << 'EOF'
 model_provider = "nvidia_gateway"
 [model_providers.nvidia_gateway]
 name = "NVIDIA LiteLLM Gateway"
-base_url = "https://inference-api.nvidia.com/v1"
+base_url = "{base_url}"
 env_key = "OPENAI_API_KEY"
 wire_api = "responses"
 EOF
@@ -76,7 +89,7 @@ def _copy_parent_dockerfile(env_dir: str, t2_env_dir: str) -> None:
         raise FileNotFoundError(f"Tools-track Dockerfile not found: {src}")
     with open(src) as f:
         content = f.read()
-    content += _AGENT_INSTALL_SNIPPET
+    content += _agent_install_snippet()
     dst = os.path.join(env_dir, "Dockerfile")
     with open(dst, "w") as f:
         f.write(content)

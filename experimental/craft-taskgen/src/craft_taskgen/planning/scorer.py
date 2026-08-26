@@ -53,12 +53,17 @@ DEFAULT_IMPLEMENTER = "aws/anthropic/bedrock-claude-sonnet-4-6"
 _WRAP_PIPELINE = Path(__file__).resolve().parents[3] / "planning" / "wrap_pipeline.py"
 
 
+def _default_api_base() -> str:
+    """Inference gateway base URL, from `OPENAI_BASE_URL`. No endpoint is hardcoded."""
+    return os.environ.get("OPENAI_BASE_URL", "")
+
+
 @dataclass
 class ScorerConfig:
     planner_a_model: str = DEFAULT_PLANNER_A
     planner_b_model: str = DEFAULT_PLANNER_B
     implementer_model: str = DEFAULT_IMPLEMENTER
-    api_base: str = "https://inference-api.nvidia.com/v1"
+    api_base: str = field(default_factory=_default_api_base)
     agent: str = "claude-code"
 
 
@@ -194,7 +199,7 @@ def run_score(
     planner_a_model: str = DEFAULT_PLANNER_A,
     planner_b_model: str = DEFAULT_PLANNER_B,
     implementer_model: str = DEFAULT_IMPLEMENTER,
-    api_base: str = "https://inference-api.nvidia.com/v1",
+    api_base: str | None = None,
     agent: str = "claude-code",
     task_filter: str | None = None,
     skip_harbor: bool = False,
@@ -219,7 +224,7 @@ def run_score(
         planner_a_model=planner_a_model,
         planner_b_model=planner_b_model,
         implementer_model=implementer_model,
-        api_base=api_base,
+        api_base=api_base or _default_api_base(),
         agent=agent,
     )
 
@@ -256,8 +261,8 @@ def run_score(
             raise RuntimeError("ANTHROPIC_API_KEY not set (source .env for NVIDIA gateway creds)")
 
         _run_wrap_pipeline(src_path, planner_dataset, "planner", None, task_filter)
-        run_harbor(planner_dataset, plans_a_trials, planner_a_model, agent, api_base, task_filter)
-        run_harbor(planner_dataset, plans_b_trials, planner_b_model, agent, api_base, task_filter)
+        run_harbor(planner_dataset, plans_a_trials, planner_a_model, agent, cfg.api_base, task_filter)
+        run_harbor(planner_dataset, plans_b_trials, planner_b_model, agent, cfg.api_base, task_filter)
 
         plans_a_resolved = resolve_harbor_output_dir(plans_a_trials)
         plans_b_resolved = resolve_harbor_output_dir(plans_b_trials)
@@ -265,8 +270,8 @@ def run_score(
         _run_wrap_pipeline(src_path, impl_a_dataset, "implementer", plans_a_resolved, task_filter)
         _run_wrap_pipeline(src_path, impl_b_dataset, "implementer", plans_b_resolved, task_filter)
 
-        run_harbor(impl_a_dataset, impl_a_trials, implementer_model, agent, api_base, task_filter)
-        run_harbor(impl_b_dataset, impl_b_trials, implementer_model, agent, api_base, task_filter)
+        run_harbor(impl_a_dataset, impl_a_trials, implementer_model, agent, cfg.api_base, task_filter)
+        run_harbor(impl_b_dataset, impl_b_trials, implementer_model, agent, cfg.api_base, task_filter)
 
     scores = score_tasks(task_names, impl_a_trials, impl_b_trials)
     write_back(cand_path, scores, cfg)

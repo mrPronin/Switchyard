@@ -48,7 +48,7 @@ Usage:
 
   # Single effort level (skip sweep)
   scripts/inference_endpoint_audit.py \\
-      --base-url https://inference-api.nvidia.com/v1 \\
+      --base-url "$OPENAI_BASE_URL" \\
       --model aws/anthropic/bedrock-claude-opus-4-6 \\
       --reasoning-effort high
 
@@ -244,7 +244,7 @@ def main(argv: list[str] | None = None) -> int:
         description="Audit an OpenAI-compat endpoint for reasoning + sampling plumbing (vLLM / gateway).",
     )
     parser.add_argument(
-        "--base-url", help="e.g. http://localhost:9000/v1 or https://inference-api.nvidia.com/v1"
+        "--base-url", help="e.g. http://localhost:9000/v1 or the gateway $OPENAI_BASE_URL"
     )
     parser.add_argument("--model", required=True, help="model id to probe")
     parser.add_argument("--api-key", help="defaults to VLLM_API_KEY / OPENAI_API_KEY / .env")

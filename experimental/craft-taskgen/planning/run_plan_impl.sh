@@ -27,8 +27,8 @@
 #
 # Example:
 #   PLANNER_MODEL=aws/anthropic/bedrock-claude-opus-4-6 \
-#   PLANNER_AGENT_KWARGS="api_base=https://inference-api.nvidia.com/v1" \
-#   IMPL_AGENT_KWARGS="api_base=https://inference-api.nvidia.com/v1" \
+#   PLANNER_AGENT_KWARGS="api_base=$OPENAI_BASE_URL" \
+#   IMPL_AGENT_KWARGS="api_base=$OPENAI_BASE_URL" \
 #   TASKS='hugapi__hug-651' \
 #   ./planning/run_plan_impl.sh
 

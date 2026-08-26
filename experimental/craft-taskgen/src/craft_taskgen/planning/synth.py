@@ -20,7 +20,7 @@ import json
 import logging
 import os
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -32,16 +32,20 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_MODEL = "openai/aws/anthropic/bedrock-claude-opus-4-6"
-DEFAULT_BASE_URL = "https://inference-api.nvidia.com/v1"
 DEFAULT_MAX_CONCURRENT = 2
 DEFAULT_MAX_TOKENS = 32768
 DEFAULT_MAX_RETRIES = 5
 
 
+def _default_base_url() -> str:
+    """Inference gateway base URL, from `OPENAI_BASE_URL`. No endpoint is hardcoded."""
+    return os.environ.get("OPENAI_BASE_URL", "")
+
+
 @dataclass
 class SynthConfig:
     model: str = DEFAULT_MODEL
-    base_url: str = DEFAULT_BASE_URL
+    base_url: str = field(default_factory=_default_base_url)
     max_concurrent: int = DEFAULT_MAX_CONCURRENT
     max_tokens: int = DEFAULT_MAX_TOKENS
     max_retries: int = DEFAULT_MAX_RETRIES
@@ -226,7 +230,7 @@ def run_synth(
     plans_dir: str | None = None,
     *,
     model: str = DEFAULT_MODEL,
-    base_url: str = DEFAULT_BASE_URL,
+    base_url: str | None = None,
     max_concurrent: int = DEFAULT_MAX_CONCURRENT,
     max_retries: int = DEFAULT_MAX_RETRIES,
     overwrite: bool = False,
@@ -257,7 +261,7 @@ def run_synth(
 
     cfg = SynthConfig(
         model=model,
-        base_url=base_url,
+        base_url=base_url or _default_base_url(),
         max_concurrent=max_concurrent,
         max_retries=max_retries,
         overwrite=overwrite,

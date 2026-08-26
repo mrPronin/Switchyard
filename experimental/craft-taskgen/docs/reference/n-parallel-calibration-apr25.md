@@ -1,6 +1,6 @@
 # N-parallel build+alignment calibration (Apr 25 2026)
 
-Calibration data behind MR 54 (`dfarris/n-parallel-build-align`). Tracks
+Calibration data behind the N-parallel build+alignment change. Tracks
 four configs across two cohorts: the standard `rerun-accepts-v2` success
 cohort and an eval-rejected cohort drawn from a recent batch.
 

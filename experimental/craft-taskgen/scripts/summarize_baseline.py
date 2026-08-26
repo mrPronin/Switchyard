@@ -123,7 +123,7 @@ _CLAUDE_API_ERROR_PATTERNS = (
 #
 #     harbor-lab rebuild-trajectories <job_dir>
 #
-# (See https://github.com/dfarris/harbor-lab — `metrics`, `rebuild-trajectories`,
+# (See the harbor-lab CLI — `metrics`, `rebuild-trajectories`,
 # `tool-sequence`, etc.) Without that step, claude-code trials show `—` for
 # all efficiency metrics. The script warns loudly when claude-code trajectory.json
 # is missing so the operator knows to rebuild.

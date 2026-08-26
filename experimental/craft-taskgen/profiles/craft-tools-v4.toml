@@ -27,7 +27,7 @@ max_build_regens_per_candidate = 2   # max alignment-feedback-driven Build regen
 max_smoke_retries = 2
 max_promising_per_repo = 25
 default_timeout = 1800
-default_concurrency = 6     # trimmed 8->6 on Apr 25 batch 8: load avg 60+/swap 97% under MR54's N=3 build+align; was driving build_dockerfile burst peak past 12 concurrent containers
+default_concurrency = 6     # trimmed 8->6 on Apr 25 batch 8: load avg 60+/swap 97% under the N=3 build+align config; was driving build_dockerfile burst peak past 12 concurrent containers
 llm_concurrency = 10        # direct-API is async; offloaded to gateway (no local cost), capped to avoid gateway throttling
 docker_concurrency = 5      # trimmed 6->5 to keep buildx CPU spikes bounded
 smoke_concurrency = 6       # trimmed 8->6: Opus smoke containers hold ~1.5-2GB each throughout; 6 keeps peak at ~12 concurrent containers, leaves ~4GB memory headroom

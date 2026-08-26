@@ -243,8 +243,8 @@ tools. Under non-interactive harbor runs (`claude -p
   trial trapped in plan mode produces 0 code edits regardless of
   agent intent.
 
-Haiku 4.5 in particular self-selects into plan mode frequently. MR 46
-repro evidence:
+Haiku 4.5 in particular self-selects into plan mode frequently. Repro
+evidence:
 
 | Config | Result |
 |---|---|
@@ -651,7 +651,7 @@ for vLLM runs — it's a no-op we happen to send.
 ## <a name="evidence"></a>Production baseline evidence (2026-04-22)
 
 Pre-plan measurements across 240 production trials on
-`craft-bench-search-001:/home/jfarris/projects/craft-bench/jobs/baseline-*-v3/`:
+`<craft-bench>/jobs/baseline-*-v3/`:
 
 | Agent × Model | Trials | Reasoning active? |
 |---|---|---|

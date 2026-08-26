@@ -677,7 +677,7 @@ case "$AGENT" in
         # read-only for 100+ turns, then treats "present plan" as
         # terminal — the trial exits with 0 code edits because
         # Write/Edit are blocked during plan mode and there's no
-        # interactive user to approve ExitPlanMode. MR 46 repro:
+        # interactive user to approve ExitPlanMode. Repro:
         # plan-on produced 0 edits over 4+ trials; plan-off produced
         # 3-9 edits per trial within the first 50 turns. Mirrors
         # runner.py's smoke-test policy. Override for ablation

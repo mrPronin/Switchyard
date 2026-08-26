@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 set -euo pipefail
 
-HARBOR_LAB="${HARBOR_LAB:-/home/bhuvana/aire/harbor-lab/.venv/bin/harbor-lab}"
+HARBOR_LAB="${HARBOR_LAB:-$(command -v harbor-lab || true)}"
 
 usage() {
   echo "Usage: $0 JOB_DIR [OUT_JSON]"

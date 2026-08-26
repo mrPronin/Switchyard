@@ -20,10 +20,10 @@ writes an output CSV with the original columns plus:
     alignment_attempts, alignment_latency_s, alignment_tokens_in,
     alignment_tokens_out, alignment_skip_reason
 
-Purpose (per plan PR B.5): see how the new alignment judge classifies a
+Purpose: see how the new alignment judge classifies a
 big heterogeneous cohort of historical instructions. Compare against the
 old hardness verdict as a *relationship check*, NOT ground truth — the
-old hardness skill was known to be noisy / confounded (MR29/MR34 → MR39).
+old hardness skill was known to be noisy / confounded.
 
 Usage:
     uv run python scripts/calibrate-alignment.py \\

@@ -59,12 +59,21 @@ def load_dockerfile_template() -> str:
 
 def write_dockerfile(env_dir: str, repo_url: str, repo_commit: str, template: str) -> str:
     """Render and write environment/Dockerfile from the template. Returns the rendered text."""
+    # The gateway base URL is environment-specific — read it at render time so no
+    # endpoint is hardcoded in the template.
+    gateway_base_url = os.environ.get("OPENAI_BASE_URL", "")
+    if not gateway_base_url:
+        raise RuntimeError(
+            "OPENAI_BASE_URL must be set — it is written into the task image's "
+            "codex config as the inference gateway base_url."
+        )
     content = (
         template.replace("{repo_url}", repo_url)
         .replace("{repo_commit}", repo_commit)
         .replace("{claude_code_version}", CLAUDE_CODE_VERSION)
         .replace("{codex_version}", CODEX_VERSION)
         .replace("{opencode_version}", OPENCODE_VERSION)
+        .replace("{gateway_base_url}", gateway_base_url)
     )
     with open(os.path.join(env_dir, "Dockerfile"), "w") as f:
         f.write(content)

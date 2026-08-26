@@ -34,9 +34,9 @@ def _dry_run(
     """
     (tmp_path / ".env").write_text(
         "ANTHROPIC_API_KEY=sk-fake-anthropic-redact-me\n"
-        "ANTHROPIC_BASE_URL=https://inference-api.nvidia.com\n"
+        "ANTHROPIC_BASE_URL=https://inference-api.test.invalid\n"
         "OPENAI_API_KEY=sk-fake-openai-redact-me\n"
-        "OPENAI_BASE_URL=https://inference-api.nvidia.com/v1\n"
+        "OPENAI_BASE_URL=https://inference-api.test.invalid/v1\n"
     )
     fake_tasks = tmp_path / "fake-tasks"
     fake_tasks.mkdir(exist_ok=True)

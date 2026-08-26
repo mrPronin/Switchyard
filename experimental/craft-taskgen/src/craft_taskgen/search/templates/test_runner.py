@@ -200,13 +200,14 @@ def llm_judge_assertions(assertions: list[str], explanation: str) -> float:
         return 1.0
 
     api_key = os.environ.get("JUDGE_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
-    base_url = os.environ.get("JUDGE_BASE_URL") or os.environ.get(
-        "OPENAI_BASE_URL", "https://inference-api.nvidia.com/v1"
-    )
+    base_url = os.environ.get("JUDGE_BASE_URL") or os.environ.get("OPENAI_BASE_URL", "")
     model = os.environ.get("JUDGE_MODEL", "aws/anthropic/bedrock-claude-sonnet-4-6")
 
-    if not api_key:
-        print("[judge] No OPENAI_API_KEY found in environment", file=sys.stderr)
+    if not api_key or not base_url:
+        print(
+            "[judge] Set OPENAI_API_KEY and OPENAI_BASE_URL (or the JUDGE_* overrides) in the environment",
+            file=sys.stderr,
+        )
         return -1.0  # sentinel: caller skips assertion weight
 
     prompt = build_judge_prompt(assertions, explanation)

@@ -13,9 +13,8 @@ capability tests, broken verifiers, or something in between."
 
 ### 1. Download trial trajectories
 
-Trial tarballs are shared on Google Drive — see the Slack thread for the
-current set:
-<https://nvidia.slack.com/archives/C0AKX8U4X43/p1777380196402149>
+Trial tarballs are shared out of band — ask the maintainers for the
+current set.
 
 Drop them into `data/` at the top of this repo. Untar in place:
 

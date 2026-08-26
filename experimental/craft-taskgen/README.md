@@ -14,7 +14,6 @@ Both pipelines evaluate with LLMs and validate with Docker. The Tools pipeline s
 
 - **craft-bench** — evaluation harness; consumes the suites produced here as `harbor-tasks/craft-taskgen-v2b/`, `harbor-tasks/craft-search-v2c/`, etc.
 - **craft-paper** — LaTeX source for the in-progress CRAFT paper.
-- **[Working Google Doc](https://docs.google.com/document/d/1GR8aWHa4lUqrugllgBvUzDRd6EtOaqUym-ExHbbgj6k/edit)** — live planning surface for open questions and weekly notes.
 
 ## Where to start
 

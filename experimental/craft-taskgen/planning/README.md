@@ -24,8 +24,8 @@ directory of planning harbor tasks.
 
 ```bash
 source /path/to/harbor/.venv/bin/activate && source /path/to/harbor/.env
-export PLANNER_AGENT_KWARGS=api_base=https://inference-api.nvidia.com/v1
-export IMPL_AGENT_KWARGS=api_base=https://inference-api.nvidia.com/v1
+export PLANNER_AGENT_KWARGS=api_base=$OPENAI_BASE_URL
+export IMPL_AGENT_KWARGS=api_base=$OPENAI_BASE_URL
 export PLANNER_MODEL=aws/anthropic/bedrock-claude-opus-4-6
 ```
 

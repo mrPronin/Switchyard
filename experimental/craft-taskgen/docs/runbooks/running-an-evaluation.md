@@ -18,7 +18,7 @@ You need a Linux/macOS host with:
 |---|---|---|
 | **Docker** | Daemon running. 50 GB+ free on the Docker root, 16 GB+ RAM for the container fleet. ZFS-backed `/scratch/docker` recommended for repeated runs (image caching). | Each task runs in its own container; Harbor builds per-task images. |
 | **Harbor + harbor-lab** | Both auto-installed by `uv sync` in step 01. Harbor is pinned (`46bb68c`); harbor-lab provides the post-run triage CLIs (`errors`, `tool-sequence`, etc.). | Harbor walks the dataset and runs the trials; harbor-lab is what you use to dig into failed trials. |
-| **inference.nvidia.com creds** | `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_BASE_URL` in `.env`. Base URLs point at `inference.nvidia.com`. Optional `VLLM_BASE_URL`/`VLLM_API_KEY` for local serving. | Every LLM call routes through `inference.nvidia.com` — there is no OAuth fallback. |
+| **Inference gateway creds** | `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_BASE_URL` in `.env`. Base URLs point at your OpenAI-compatible inference gateway. Optional `VLLM_BASE_URL`/`VLLM_API_KEY` for local serving. | Every LLM call routes through the gateway — there is no OAuth fallback. |
 | **`gh auth status` OK** | One-time `gh auth login` if you've never used the GitHub CLI on this host. | The mining step (only needed when you build tasks from scratch) uses it; preflight checks it regardless. |
 
 ## 01 · Clone and install
@@ -43,15 +43,15 @@ If the glob doesn't match exactly one directory, fix the path manually
 (`.venv/lib/python3.13/site-packages`). Silent glob misses are the most
 common source of "Harbor smoke behaves weirdly" later.
 
-## 02 · Add inference.nvidia.com creds and run preflight
+## 02 · Add inference gateway creds and run preflight
 
 ```bash
 # .env at the repo root
 cat > .env <<'EOF'
 ANTHROPIC_API_KEY=<your-key>
-ANTHROPIC_BASE_URL=https://inference.nvidia.com/v1
+ANTHROPIC_BASE_URL=<your-gateway-base-url>
 OPENAI_API_KEY=<your-key>
-OPENAI_BASE_URL=https://inference.nvidia.com/v1
+OPENAI_BASE_URL=<your-gateway-base-url>
 EOF
 
 uv run craft-taskgen-preflight \

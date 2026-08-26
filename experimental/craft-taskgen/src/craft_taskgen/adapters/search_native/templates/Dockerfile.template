@@ -19,7 +19,7 @@ model_provider = "nvidia_gateway"
 
 [model_providers.nvidia_gateway]
 name = "NVIDIA LiteLLM Gateway"
-base_url = "https://inference-api.nvidia.com/v1"
+base_url = "{gateway_base_url}"
 env_key = "OPENAI_API_KEY"
 wire_api = "responses"
 EOF

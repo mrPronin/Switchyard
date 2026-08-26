@@ -28,7 +28,7 @@ from craft_taskgen.config import (
     TaskState,
 )
 from craft_taskgen.diagnostics import _next_diagnostic_path, _write_diagnostic
-from craft_taskgen.gateway import build_gateway_env
+from craft_taskgen.gateway import build_gateway_env, get_openai_gateway_creds
 from craft_taskgen.prompts import (
     fix_docker_prompt,
     fix_f2p_p2p_classify_prompt,
@@ -295,10 +295,8 @@ def summarize(text: str, *, model: str = _SUMMARY_MODEL, max_chars: int = 1500) 
     try:
         import openai
 
-        client = openai.OpenAI(
-            api_key=os.environ.get("OPENAI_API_KEY", ""),
-            base_url=os.environ.get("OPENAI_API_BASE", "https://inference-api.nvidia.com/v1"),
-        )
+        api_key, base_url = get_openai_gateway_creds()
+        client = openai.OpenAI(api_key=api_key, base_url=base_url)
         resp = client.chat.completions.create(
             model=model,
             messages=[

@@ -25,7 +25,7 @@ For each task that has at least one upstream-fetch trial, the report
 breaks the task's pass/fail counts into clean vs tainted subsets so
 reviewers can decide whether the task itself remains scorable.
 
-Inspired by harbor-datasets MR23's `tools/check-integrity.py`, which uses a
+Inspired by harbor-datasets' `tools/check-integrity.py`, which uses a
 JSON config of forbidden patterns. This script hard-codes craft-bench-style
 heuristics (open-internet containers + upstream-source leak via curl); if the
 catalog of forbidden domains expands, lift the regex constants into a config.

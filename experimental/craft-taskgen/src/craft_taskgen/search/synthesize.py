@@ -577,12 +577,13 @@ def run_synthesis(
     load_dotenv()
 
     api_key = os.environ.get("JUDGE_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
-    base_url = os.environ.get("JUDGE_BASE_URL") or os.environ.get(
-        "OPENAI_BASE_URL", "https://inference-api.nvidia.com/v1"
-    )
-    if not api_key and not dry_run:
-        print("ERROR: Set JUDGE_API_KEY or OPENAI_API_KEY.", file=sys.stderr)
-        raise RuntimeError("Missing API key for synthesis")
+    base_url = os.environ.get("JUDGE_BASE_URL") or os.environ.get("OPENAI_BASE_URL", "")
+    if not dry_run and (not api_key or not base_url):
+        print(
+            "ERROR: Set JUDGE_API_KEY/OPENAI_API_KEY and JUDGE_BASE_URL/OPENAI_BASE_URL.",
+            file=sys.stderr,
+        )
+        raise RuntimeError("Missing API key or base URL for synthesis")
 
     combined_path = os.path.join(contexts_dir, "_all_contexts.json")
     if not os.path.exists(combined_path):
