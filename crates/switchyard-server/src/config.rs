@@ -476,6 +476,8 @@ enum RouteConfig {
         tool_calling: Option<bool>,
         #[serde(default)]
         reasoning: Option<bool>,
+        #[serde(default)]
+        vision: Option<bool>,
     },
     Random {
         id: ModelId,
@@ -485,6 +487,8 @@ enum RouteConfig {
         tool_calling: Option<bool>,
         #[serde(default)]
         reasoning: Option<bool>,
+        #[serde(default)]
+        vision: Option<bool>,
         targets: Vec<String>,
         weights: Option<Vec<f64>>,
         seed: Option<u64>,
@@ -497,6 +501,8 @@ enum RouteConfig {
         tool_calling: Option<bool>,
         #[serde(default)]
         reasoning: Option<bool>,
+        #[serde(default)]
+        vision: Option<bool>,
         target: String,
         #[serde(default)]
         subagents: Option<SubagentRouteConfig>,
@@ -509,6 +515,8 @@ enum RouteConfig {
         tool_calling: Option<bool>,
         #[serde(default)]
         reasoning: Option<bool>,
+        #[serde(default)]
+        vision: Option<bool>,
         #[serde(flatten)]
         config: LlmClassifierRouteConfig,
     },
@@ -520,6 +528,8 @@ enum RouteConfig {
         tool_calling: Option<bool>,
         #[serde(default)]
         reasoning: Option<bool>,
+        #[serde(default)]
+        vision: Option<bool>,
         capable_target: String,
         efficient_target: String,
         /// Tier a turn falls back to when the signals are not confident.
@@ -551,6 +561,8 @@ enum RouteConfig {
         tool_calling: Option<bool>,
         #[serde(default)]
         reasoning: Option<bool>,
+        #[serde(default)]
+        vision: Option<bool>,
         /// Serves every client-visible turn; also the count_tokens target.
         executor_target: String,
         /// Reviews the executor's first terminal turn. Judge-only, never a
@@ -740,41 +752,48 @@ impl RouteConfig {
                 context_window,
                 tool_calling,
                 reasoning,
+                vision,
                 ..
             }
             | Random {
                 context_window,
                 tool_calling,
                 reasoning,
+                vision,
                 ..
             }
             | Passthrough {
                 context_window,
                 tool_calling,
                 reasoning,
+                vision,
                 ..
             }
             | LlmClassifier {
                 context_window,
                 tool_calling,
                 reasoning,
+                vision,
                 ..
             }
             | StageRouter {
                 context_window,
                 tool_calling,
                 reasoning,
+                vision,
                 ..
             }
             | Advisor {
                 context_window,
                 tool_calling,
                 reasoning,
+                vision,
                 ..
             } => ModelCapabilities {
                 context_window: *context_window,
                 tool_calling: *tool_calling,
                 reasoning: *reasoning,
+                vision: *vision,
             },
         }
     }

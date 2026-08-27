@@ -18,9 +18,9 @@ use crate::diagnostic::TranslationDiagnostic;
 use crate::error::{Result, TranslationError};
 use crate::format::{FormatId, WireFormat};
 use crate::llm::{
-    AggLlmResponse, ContentBlock, LlmRequest, MediaSource, Message, OutputParams,
-    ProviderExtensions, ReasoningParams, ResponseOutput, Role, SamplingParams, StopReason,
-    ToolCall, ToolChoice, ToolDefinition, ToolResult, Usage,
+    AggLlmResponse, ContentBlock, FileSource, ImageSource, LlmRequest, MediaSource, Message,
+    OutputParams, ProviderExtensions, ReasoningParams, ResponseOutput, Role, SamplingParams,
+    StopReason, ToolCall, ToolChoice, ToolDefinition, ToolResult, Usage,
 };
 use crate::policy::{DeterministicIdPolicy, TranslationPolicy};
 use crate::util::{
@@ -1141,9 +1141,18 @@ fn encode_responses_content(
             ContentBlock::Refusal { text } => {
                 blocks.push(json!({"type": "refusal", "refusal": text}));
             }
-            ContentBlock::Image { source } => {
-                blocks.push(json!({"type": "input_image", "image_url": source}));
-            }
+            ContentBlock::Image { source } => match responses_image_part(source) {
+                Some(part) => blocks.push(part),
+                None => {
+                    push_lossy(
+                        diagnostics,
+                        policy,
+                        "Responses codec could not map image content",
+                    )?;
+                    let raw = serde_json::to_value(source).unwrap_or_default();
+                    blocks.push(json!({"type": "input_text", "text": json_string(&raw)}));
+                }
+            },
             ContentBlock::Audio { source } => blocks.push(match source {
                 MediaSource::Raw(raw) => json!({"type": "input_text", "text": json_string(raw)}),
                 MediaSource::Url { url, media_type } => json!({
@@ -1169,7 +1178,7 @@ fn encode_responses_content(
                 }),
             }),
             ContentBlock::File { source } => {
-                blocks.push(json!({"type": "input_file", "file": source}));
+                blocks.push(responses_file_part(source));
             }
             ContentBlock::Unknown { raw, .. } => {
                 push_lossy(
@@ -1185,6 +1194,89 @@ fn encode_responses_content(
         }
     }
     Ok(Value::Array(blocks))
+}
+
+// Encodes a normalized image source as a Responses `input_image` part.
+//
+// `ImageSource` is adjacently tagged (`#[serde(tag = "type", content = "data")]`),
+// so serializing it inline emits `{"type": "url", "data": {..}}` where the
+// Responses API requires `image_url` to be a bare URL or data-URI string. The
+// Chat and Anthropic codecs destructure it for this reason; this mirrors
+// `openai_chat::openai_image_part`.
+fn responses_image_part(source: &ImageSource) -> Option<Value> {
+    match source {
+        ImageSource::Url { url, detail } => {
+            let mut part = json!({"type": "input_image", "image_url": url});
+            if let Some(detail) = detail {
+                part["detail"] = Value::String(detail.clone());
+            }
+            Some(part)
+        }
+        ImageSource::Base64 { media_type, data } => media_type.as_ref().map(|media_type| {
+            json!({
+                "type": "input_image",
+                "image_url": format!("data:{media_type};base64,{data}"),
+            })
+        }),
+        ImageSource::Raw(raw) => responses_raw_image_part(raw),
+    }
+}
+
+// Recovers a Responses `input_image` part from a provider image source that has
+// no normalized representation.
+fn responses_raw_image_part(raw: &Value) -> Option<Value> {
+    if let Some(url) = raw.as_str() {
+        return Some(json!({"type": "input_image", "image_url": url}));
+    }
+    let object = raw.as_object()?;
+    // An Anthropic image arrives as the whole `{"type": "image", "source": {..}}`
+    // block, so the payload lives one level down.
+    let object = if object.get("type").and_then(Value::as_str) == Some("image") {
+        let source = object.get("source").and_then(Value::as_object)?;
+        if !matches!(
+            source.get("type").and_then(Value::as_str),
+            Some("base64" | "url")
+        ) {
+            return None;
+        }
+        source
+    } else {
+        object
+    };
+    for key in ["url", "image_url"] {
+        if let Some(url) = object.get(key).and_then(Value::as_str) {
+            return Some(json!({"type": "input_image", "image_url": url}));
+        }
+    }
+    let data = object.get("data").and_then(Value::as_str)?;
+    let media_type = object
+        .get("media_type")
+        .and_then(Value::as_str)
+        .unwrap_or("application/octet-stream");
+    Some(json!({
+        "type": "input_image",
+        "image_url": format!("data:{media_type};base64,{data}"),
+    }))
+}
+
+// Encodes a normalized file source as a Responses `input_file` part.
+//
+// `FileSource` carries the same adjacent tagging as `ImageSource`, so it cannot
+// be serialized inline either. The nested `file` object is the shape
+// `decode_file_source` reads back for every variant.
+fn responses_file_part(source: &FileSource) -> Value {
+    let file = match source {
+        FileSource::FileId(file_id) => json!({"file_id": file_id}),
+        FileSource::FileData { data, filename } => {
+            let mut file = json!({"file_data": data});
+            if let Some(filename) = filename {
+                file["filename"] = Value::String(filename.clone());
+            }
+            file
+        }
+        FileSource::Raw(raw) => raw.clone(),
+    };
+    json!({"type": "input_file", "file": file})
 }
 
 // Encodes normalized tool definitions into Responses tool JSON.
