@@ -112,6 +112,7 @@ Every route takes the common keys below, plus the keys for its type.
 | `context_window` | No | unset | Positive token count advertised for this route by `GET /v1/models`. Unset values appear as `null`. This does not enforce a request limit. |
 | `tool_calling` | No | unset | Whether `GET /v1/models` advertises tool-calling support for this route. Unset values appear as `null`. |
 | `reasoning` | No | unset | Whether `GET /v1/models` advertises reasoning support to Codex direct-provider discovery. Unset routes are advertised as non-reasoning. |
+| `vision` | No | unset | Whether `GET /v1/models` advertises **image input** to Codex direct-provider discovery. Unset routes are advertised as text-only. ⚠ Load-bearing: Codex reads `input_modalities` from the model card and, when it says text-only, replaces an attached image with the text `image content omitted because you do not support image input` **before sending** — so a route that can see but does not declare `vision = true` loses the image in the client, and Switchyard never receives one to forward. Declare it only when every target the route can select accepts images. |
 
 ### `noop`
 

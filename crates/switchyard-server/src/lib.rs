@@ -101,6 +101,16 @@ struct ModelCapabilities {
     // this, so a route opts in via config; undeclared routes advertise as
     // non-reasoning to Codex (fail closed).
     reasoning: Option<bool>,
+    // Whether the routed model accepts image input. Declared per route for the same
+    // reason as `reasoning`: the server cannot probe it, and it must fail closed
+    // because a route may resolve to a target with no vision at all.
+    //
+    // ⚠ This is load-bearing for more than metadata. Codex reads `input_modalities`
+    // from the model card and, when it says text-only, REPLACES an attached image
+    // with the literal text "image content omitted because you do not support image
+    // input" before sending. So an undeclared route does not merely under-advertise
+    // -- it silently loses the image, and the proxy never sees one to forward.
+    vision: Option<bool>,
 }
 
 /// A registered algorithm route and its server-owned endpoint metadata.
@@ -1352,6 +1362,7 @@ fn model_entry_json(model: &str, capabilities: ModelCapabilities) -> Value {
         "capabilities": {
             "streaming": true,
             "tool_calling": capabilities.tool_calling,
+            "vision": capabilities.vision,
             "context_window": capabilities.context_window,
             "supported_inbound_formats": [
                 "openai-chat-completions",
@@ -1417,7 +1428,13 @@ fn codex_model_entry_json(model: &str, capabilities: ModelCapabilities, priority
         "max_context_window": capabilities.context_window,
         "effective_context_window_percent": 95,
         "experimental_supported_tools": [],
-        "input_modalities": ["text"],
+        // ⚠ Codex omits an attached image client-side when this says text-only, so a
+        // route that can see must declare `vision = true`. Fails closed.
+        "input_modalities": if capabilities.vision.unwrap_or(false) {
+            json!(["text", "image"])
+        } else {
+            json!(["text"])
+        },
         "supports_search_tool": false,
     })
 }
