@@ -2176,3 +2176,136 @@ fn anthropic_thinking_is_dropped_from_responses_input() -> TestResult {
     );
     Ok(())
 }
+
+// Verifies a Responses `input_image` keeps `image_url` as a bare string.
+//
+// Codex sends `{"type": "input_image", "image_url": "data:image/png;base64,.."}`.
+// `ImageSource` is adjacently tagged, so encoding it inline produced
+// `image_url: {"type": "url", "data": {..}}`, which upstream cannot read -- the
+// image was accepted, silently unreadable, and the model saw no image at all.
+#[test]
+fn responses_input_image_keeps_image_url_as_string() -> TestResult {
+    let engine = TranslationEngine::default();
+    let data_uri = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==";
+    let body = json!({
+        "model": "gpt-5.4-mini",
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "What is in this image?"},
+                {"type": "input_image", "image_url": data_uri}
+            ]
+        }]
+    });
+
+    let output = engine
+        .translate_request(
+            WireFormat::OpenAiResponses,
+            WireFormat::OpenAiResponses,
+            &body,
+            &TranslationPolicy::default(),
+        )?
+        .body;
+
+    let content = output["input"][0]["content"]
+        .as_array()
+        .ok_or("Responses content should be an array")?;
+    let image = content
+        .iter()
+        .find(|block| block["type"] == "input_image")
+        .ok_or("input_image block should survive translation")?;
+    assert_eq!(
+        image["image_url"],
+        Value::String(data_uri.to_string()),
+        "image_url must be a bare string, not a tagged ImageSource"
+    );
+    Ok(())
+}
+
+// Verifies `detail` survives as a sibling key of `image_url`.
+#[test]
+fn responses_input_image_preserves_detail() -> TestResult {
+    let engine = TranslationEngine::default();
+    let body = json!({
+        "model": "gpt-5.4-mini",
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "look"},
+                {
+                    "type": "input_image",
+                    "image_url": "https://example.test/image.png",
+                    "detail": "high"
+                }
+            ]
+        }]
+    });
+
+    let output = engine
+        .translate_request(
+            WireFormat::OpenAiResponses,
+            WireFormat::OpenAiResponses,
+            &body,
+            &TranslationPolicy::default(),
+        )?
+        .body;
+
+    let content = output["input"][0]["content"]
+        .as_array()
+        .ok_or("Responses content should be an array")?;
+    let image = content
+        .iter()
+        .find(|block| block["type"] == "input_image")
+        .ok_or("input_image block should survive translation")?;
+    assert_eq!(image["image_url"], "https://example.test/image.png");
+    assert_eq!(image["detail"], "high");
+    Ok(())
+}
+
+// Verifies an Anthropic base64 image encodes to a Responses data-URI string.
+#[test]
+fn anthropic_image_encodes_as_responses_input_image_string() -> TestResult {
+    let engine = TranslationEngine::default();
+    let body = json!({
+        "model": "claude-sonnet-4-20250514",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe"},
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "iVBORw0KGgoAAAANSUhEUg=="
+                    }
+                }
+            ]
+        }],
+        "max_tokens": 1024
+    });
+
+    let output = engine
+        .translate_request(
+            WireFormat::AnthropicMessages,
+            WireFormat::OpenAiResponses,
+            &body,
+            &TranslationPolicy::default(),
+        )?
+        .body;
+
+    let content = output["input"][0]["content"]
+        .as_array()
+        .ok_or("Responses content should be an array")?;
+    let image = content
+        .iter()
+        .find(|block| block["type"] == "input_image")
+        .ok_or("input_image block should survive translation")?;
+    let url = image["image_url"]
+        .as_str()
+        .ok_or("image_url must be a bare string, not a tagged ImageSource")?;
+    assert_eq!(url, "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==");
+    Ok(())
+}
