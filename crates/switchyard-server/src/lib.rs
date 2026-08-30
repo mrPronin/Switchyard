@@ -1392,13 +1392,45 @@ fn model_entry_json(model: &str, capabilities: ModelCapabilities) -> Value {
 // supported_parameters — and fall back to the route's declared value. Some backends
 // publish nothing (the NVIDIA gateway returns id-only models and blocks /model/info),
 // so keep failing closed to config.
+// Codex ADOPTS whatever `base_instructions` the catalog advertises, so the stub below
+// replaces Codex's own system prompt on every routed session (upstream issue #565). That is
+// harmless for routing and fatal for measurement: a quality number taken through the proxy
+// describes an agent running a six-word prompt, not Codex.
+//
+// `SWITCHYARD_BASE_INSTRUCTIONS` makes it controllable without moving the default:
+//
+//   unset            -> the historical stub, so existing deployments do not change
+//   set to a string  -> that string is advertised verbatim
+//   set to EMPTY     -> the field is OMITTED from the card entirely, which is what lets
+//                       Codex fall back to its own bundled prompt
+//
+// The empty case REMOVES the key rather than sending `null` or `""`: the point is to say
+// nothing about base instructions, and a present-but-empty string is still a value to adopt.
+const BASE_INSTRUCTIONS_ENV: &str = "SWITCHYARD_BASE_INSTRUCTIONS";
+const BASE_INSTRUCTIONS_STUB: &str = "You are Codex, a coding agent.";
+
+fn base_instructions_override() -> Option<String> {
+    std::env::var(BASE_INSTRUCTIONS_ENV).ok()
+}
+
+fn base_instructions_omitted() -> bool {
+    matches!(base_instructions_override().as_deref(), Some(""))
+}
+
+fn codex_base_instructions() -> String {
+    match base_instructions_override() {
+        Some(value) if !value.is_empty() => value,
+        _ => BASE_INSTRUCTIONS_STUB.to_string(),
+    }
+}
+
 fn codex_model_entry_json(model: &str, capabilities: ModelCapabilities, priority: usize) -> Value {
     // Codex is non-functional without shell and apply_patch, so an undeclared tool
     // capability defaults to enabled here; the OpenAI `data` entry reports the raw
     // Option separately for clients that want the undeclared state.
     let tool_calling = capabilities.tool_calling.unwrap_or(true);
     let reasoning = capabilities.reasoning.unwrap_or(false);
-    json!({
+    let mut entry = json!({
         "slug": model,
         "display_name": model,
         "description": "Switchyard-routed model.",
@@ -1414,7 +1446,7 @@ fn codex_model_entry_json(model: &str, capabilities: ModelCapabilities, priority
         "upgrade": null,
         // Required `ModelInfo` string. Unlike the launcher, the server cannot read
         // Codex's bundled prompt, so it sends a minimal stub.
-        "base_instructions": "You are Codex, a coding agent.",
+        "base_instructions": codex_base_instructions(),
         "supports_reasoning_summaries": reasoning,
         "default_reasoning_summary": "none",
         "support_verbosity": reasoning,
@@ -1436,7 +1468,14 @@ fn codex_model_entry_json(model: &str, capabilities: ModelCapabilities, priority
             json!(["text"])
         },
         "supports_search_tool": false,
-    })
+    });
+    // Omit rather than blank: see BASE_INSTRUCTIONS_ENV above.
+    if base_instructions_omitted() {
+        if let Some(object) = entry.as_object_mut() {
+            object.remove("base_instructions");
+        }
+    }
+    entry
 }
 
 // The reasoning-effort presets Codex offers for a reasoning-capable route. Kept in
