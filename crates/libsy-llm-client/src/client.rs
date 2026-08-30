@@ -63,6 +63,7 @@ pub struct ModelConfig {
     default_backend: Backend,
     other_backends: Option<Vec<Backend>>,
     responses_reasoning: crate::ResponsesReasoningPolicy,
+    responses_tool_images: crate::ResponsesToolImagePolicy,
 }
 
 impl ModelConfig {
@@ -78,11 +79,18 @@ impl ModelConfig {
             default_backend,
             other_backends,
             responses_reasoning: crate::ResponsesReasoningPolicy::default(),
+            responses_tool_images: crate::ResponsesToolImagePolicy::default(),
         }
     }
 
     /// Sets how Responses reasoning items are replayed to this model.
     #[must_use]
+    /// Where an image returned by a TOOL is placed for this model's upstream.
+    pub fn with_responses_tool_images(mut self, policy: crate::ResponsesToolImagePolicy) -> Self {
+        self.responses_tool_images = policy;
+        self
+    }
+
     pub fn with_responses_reasoning(mut self, policy: crate::ResponsesReasoningPolicy) -> Self {
         self.responses_reasoning = policy;
         self
@@ -234,6 +242,14 @@ impl TranslatingLlmClient {
             self.model_to_config
                 .get(model)
                 .map(|config| config.responses_reasoning)
+                .unwrap_or_default()
+                .normalize(&mut body);
+            // ⛔ AFTER the reasoning pass and BEFORE `merge_extra_body`, so a target can still
+            // override deliberately. Moves a tool-returned image into a following user message
+            // for upstreams that reject one inside a `function_call_output` (llama.cpp).
+            self.model_to_config
+                .get(model)
+                .map(|config| config.responses_tool_images)
                 .unwrap_or_default()
                 .normalize(&mut body);
         }

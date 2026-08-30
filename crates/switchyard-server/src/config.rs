@@ -19,7 +19,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use switchyard_llm_client::{
     Backend, ClientRouter, DEFAULT_MAX_RETRIES, HttpBackendConfig, ModelConfig,
-    ResponsesReasoningPolicy, TranslatingLlmClient,
+    ResponsesReasoningPolicy, ResponsesToolImagePolicy, TranslatingLlmClient,
 };
 use switchyard_protocol::{ModelId, RoutedLlmClient, WireFormat};
 
@@ -159,7 +159,8 @@ impl ServerConfig {
                     build_backend(&target.llm_client, client_config, &target.extra_body)?,
                     None,
                 )
-                .with_responses_reasoning(client_config.responses_reasoning.unwrap_or_default()),
+                .with_responses_reasoning(client_config.responses_reasoning.unwrap_or_default())
+                .with_responses_tool_images(client_config.responses_tool_images.unwrap_or_default()),
             );
         }
 
@@ -309,6 +310,11 @@ pub(crate) struct LlmClientConfig {
     #[serde(default = "default_max_retries")]
     max_retries: u32,
     responses_reasoning: Option<ResponsesReasoningPolicy>,
+    /// Where an image returned by a TOOL is placed. `rehome` moves it into a following
+    /// user message, for upstreams that reject one inside a `function_call_output`
+    /// (llama.cpp answers `400 "Output of tool call should be 'Input text'"`).
+    /// Default `inline` keeps the caller's payload, which hosted providers accept.
+    responses_tool_images: Option<ResponsesToolImagePolicy>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1004,6 +1010,11 @@ fn build_backend(
     if config.forward_auth && config.api_key_env.is_some() {
         return Err(ServerError::new(format!(
             "llm client {client_name} cannot set both forward_auth and api_key_env"
+        )));
+    }
+    if config.responses_tool_images.is_some() && config.format != ClientFormat::OpenAiResponses {
+        return Err(ServerError::new(format!(
+            "llm client {client_name} responses_tool_images is only valid for openai_responses"
         )));
     }
     if config.responses_reasoning.is_some() && config.format != ClientFormat::OpenAiResponses {
