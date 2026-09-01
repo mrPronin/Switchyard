@@ -21,13 +21,19 @@ algorithm you write yourself.
 - **Protocol Translation**: convert between OpenAI Chat, Anthropic Messages, and OpenAI Responses formats
 - **Multi-Backend Routing**: random routing, LLM-as-classifier routing, signal-driven stage-router, or your own algorithm
 - **Operational Metrics**: Prometheus metrics cover requests, errors, latency, tokens, and routing overhead
+- **NeMo Relay Plugin**: run Switchyard-configured routes in NeMo Relay—including any routing algorithm supported by `switchyard-runner`—while Switchyard owns provider HTTP dispatch
 
 ## Maturity
 
 Switchyard is pre-alpha software that is evolving rapidly. The API and algorithms are expected to change significantly before we reach v1.0.
 
 > [!WARNING]
-> Experimental software. Not for production use.
+> Switchyard is a very young project showcasing active research. Component maturity levels:
+>
+> - libsy: Beta. Ready for trial integration.
+> - switchyard-llm-client: Alpha. May change significantly.
+> - switchyard-runner: Alpha. Evolving rapidly.
+> - switchyard-server: Demo server, not for production use.
 
 ## Quick Start
 
@@ -90,6 +96,7 @@ algorithm list, or the [`switchyard-libsy`](crates/libsy/README.md) crate docs.
 | [LLM Classifier](docs/routing_algorithms/llm_classifier_routing.md) | Request content should decide whether a turn needs the weak or strong tier. | `llm_classifier` |
 | [Stage Router](docs/routing_algorithms/stage_router_routing.md) | Signals already in the conversation, such as tool results and errors, should route most turns without an extra model call. | `stage_router` |
 | [Escalation Router](docs/routing_algorithms/escalation_router_routing.md) | Every turn runs on the weak tier first, and a judge reads that answer to decide whether to send the same request to the strong tier. | `llm_classifier` with `mode = "escalation"` |
+| [Composite](docs/routing_algorithms/composite_routing.md) | Routing algorithms are composed, one setting the configuration of another before handing off. Today an LLM classifier sets the tier a stage router falls open to. | `composite` |
 | [Random](docs/routing_algorithms/random_routing.md) | You need a fixed traffic split for A/B tests, baselines, or cost experiments. | `random` |
 
 A `passthrough` route registers one target under one model ID with no routing
@@ -123,6 +130,7 @@ configured LLM client selects one upstream format.
 - **[`switchyard-libsy`](crates/libsy/README.md)**: embed routing algorithms in a Rust application
 - **[`switchyard-protocol`](crates/protocol/README.md)**: provider-neutral request, response, and streaming types
 - **[`switchyard-translation`](crates/switchyard-translation/README.md)**: request, response, and stream translation
+- **[`switchyard-nemo-relay-plugin`](crates/switchyard-nemo-relay-plugin/README.md)**: install Switchyard as a native NeMo Relay plugin
 
 ## Community
 

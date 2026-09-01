@@ -32,6 +32,13 @@ target = "strong"
 `schema_version` must be `1`. Table names under `llm_clients`, `targets`, and
 `routes` are local references; clients send the route's `id` as the model name.
 
+The optional top-level `fallback_client` names an entry under `[llm_clients]`. When set, any HTTP
+method and path not implemented by Switchyard is forwarded through that client without translating
+the path, query string, body, response, or model identifier. The fallback client does not need a
+target. Only its `base_url` is used: caller end-to-end headers are forwarded, hop-by-hop headers are
+removed, and configured API keys, extra headers, format, and retries are not applied. When omitted,
+unmatched paths return `404`.
+
 `schema_version`, `[targets]`, and `[routes]` must all be present, even when a
 route reaches no upstream. A file without a `[targets]` table is rejected with
 `missing field targets`; an empty `[targets]` table satisfies it.
@@ -174,7 +181,7 @@ Capability mode classifies before serving. See
 | `weak_target` | Yes | — | Efficient tier. |
 | `base_threshold` | Yes | — | Lowest solve probability that routes to the weak target. In `[0, 1]`. |
 | `threshold_step` | No | `0.0` | Finite, non-negative amount added once for uncertain or unmatched verdicts and twice for unsupported verdicts. `base_threshold + 2 * threshold_step` must be at most `1`. |
-| `classify_trigger` | No | `every_request` | When the judge runs. `every_request` judges every request, tool continuations included. `user_turn` judges each new user message and holds that target across the tool calls between. `new_session` judges once and reuses that target for the session. |
+| `classify_trigger` | No | `every_request` | When the judge runs. `every_request` judges every request, tool continuations included. `user_turn` judges each new user message and retains that target across intervening tool calls only when requests carry a session ID; without a session ID, it behaves like `every_request`. `new_session` judges once and reuses that target for the session. |
 | `message_hash_fallback` | No | `false` | Keys affinity on the first user message. Requires `classify_trigger = "new_session"`. |
 | `recent_turn_window` | No | unset | When unset, the judge sees the opening task and latest user follow-up, when present. When set, it also sees trailing turns. |
 | `prompt` | No | packaged prompt | Replaces the capability prompt. The packaged schema is sent separately as structured-output configuration. |
@@ -203,7 +210,7 @@ policy selector, and routes to any configured target label.
 | `prompt` | Yes | — | Judge system prompt. The configured inner schema is sent separately as structured-output configuration. |
 | `response_schema` | Yes | — | Inner JSON Schema encoded as a TOML string. Switchyard adds the provider wrapper. |
 | `policy` | Yes | — | Policy table. `target_selector` accepts a JSON Pointer such as `/decision/target`. |
-| `classify_trigger` | No | `every_request` | When the judge runs. `every_request` judges every request, tool continuations included. `user_turn` judges each new user message and holds that target across the tool calls between. `new_session` judges once and reuses that target for the session. |
+| `classify_trigger` | No | `every_request` | When the judge runs. `every_request` judges every request, tool continuations included. `user_turn` judges each new user message and retains that target across intervening tool calls only when requests carry a session ID; without a session ID, it behaves like `every_request`. `new_session` judges once and reuses that target for the session. |
 | `message_hash_fallback` | No | `false` | Keys affinity on the first user message. Requires `classify_trigger = "new_session"`. |
 | `recent_turn_window` | No | unset | When unset, the judge sees the opening task and latest user follow-up, when present. When set, it also sees trailing turns. |
 
@@ -229,6 +236,32 @@ optional `handoff_notes` and `classifier` tables and for tuning.
 | `classifier.classify_trigger` | No | `every_request` | When the judge runs. See the `llm_classifier` route. `new_session` has no effect here. |
 | `classifier.response_format_type` | No | `json_schema` | Structured-output mode for the optional classifier judge. Use `json_object` when the classifier provider does not support JSON Schema; Switchyard adds the schema to the prompt and validates the verdict locally. |
 | `subagents` | No | unset | Nested `passthrough` or custom `llm_classifier` policy used only for delegated sub-agent work. See [Sub-Agent-Aware Routing](../routing_algorithms/subagent_routing.md). |
+
+### `composite`
+
+Composes other algorithms, letting one set another's
+configuration. Today a classifier sets the tier a stage router falls open to when its own signals are not confident, leaving its scoring and escalation logic untouched. See
+[Composite Routing](../routing_algorithms/composite_routing.md).
+
+| Key | Required | Default | Meaning |
+|---|:---:|---|---|
+| `classifier.target` | Yes | — | Target the tier judge is called through. Not a routing destination. |
+| `classifier.base_threshold` | Yes | — | `p_solve` floor that still routes to the efficient tier. In `[0, 1]`. |
+| `classifier.classify_trigger` | Yes | — | `user_turn` re-picks the tier whenever the user speaks, `new_session` picks once and holds it. `every_request` is rejected here: a judge call per tool step is the cost this route exists to avoid. |
+| `classifier.message_hash_fallback` | No | `false` | Retains the tier by hashing the first user message, for clients that send no session ID. Unlike the `llm_classifier` route, this works on either trigger. Conversations opening with the same text share a tier. |
+| `stage.capable_target` | Yes | — | Capable tier. |
+| `stage.efficient_target` | Yes | — | Efficient tier. |
+| `stage.confidence_threshold` | Yes | — | Corroboration a decisive signal needs. In `[0, 1]`. |
+| `stage.recent_turn_window` | No | `3` | Trailing tool results the signals are computed over. |
+| `stage.capable_system_prompt` | No | unset | System prompt handed to the capable tier. |
+| `stage.efficient_system_prompt` | No | unset | System prompt handed to the efficient tier. |
+| `subagents` | No | unset | Nested policy used only for delegated sub-agent work. |
+
+The tier is retained per session. A deployment that sends no session ID needs
+`classifier.message_hash_fallback = true`, which keys on the first user message
+instead. The stage table takes no `picker`: the classifier supplies that tier per turn. A turn the
+classifier cannot reach falls open to the efficient tier. Leaving out
+`classifier` is recommended: that judge runs ahead of the fall-open tier.
 
 ## Validation Errors
 

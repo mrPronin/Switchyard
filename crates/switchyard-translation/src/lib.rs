@@ -19,7 +19,8 @@ pub mod stream;
 pub mod util;
 
 pub use switchyard_protocol::stream::{
-    LlmResponseChunk, LlmResponseStream, LlmResponseStreamEvent, ProviderStreamEvent,
+    LlmResponseChunk, LlmResponseStream, LlmResponseStreamEvent, LlmStreamError,
+    ProviderStreamEvent,
 };
 pub use switchyard_protocol::{format, llm};
 
@@ -32,5 +33,6 @@ pub use llm::*;
 pub use policy::*;
 pub use stream::*;
 pub use util::{
-    PRESERVATION_METADATA_KEY, normalize_anthropic_tool_use_ids, sanitize_anthropic_tool_use_id,
+    PRESERVATION_METADATA_KEY, normalize_anthropic_tool_use_ids, prepare_request_for_target,
+    sanitize_anthropic_tool_use_id,
 };

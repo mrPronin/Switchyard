@@ -8,12 +8,86 @@ pub mod common;
 use pretty_assertions::assert_eq;
 use serde_json::{Value, json};
 use switchyard_translation::{
-    LossyConversionPolicy, TranslationEngine, TranslationPolicy, WireFormat,
+    FormatId, LossyConversionPolicy, TranslationEngine, TranslationPolicy, WireFormat,
+    prepare_request_for_target, sanitize_anthropic_tool_use_id,
 };
 
 use common::{REASONING_MODEL, normalized_policy, shell_tool_call};
 
-type TestResult = std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
+type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+// A target prompt makes every preserved provider body stale.
+#[test]
+fn preparing_a_target_prompt_invalidates_exact_replay() -> TestResult {
+    let engine = TranslationEngine::default();
+    let policy = TranslationPolicy::default();
+    let body = json!({
+        "model": "route",
+        "messages": [
+            {"role": "system", "name": "caller", "content": "client prompt"},
+            {"role": "user", "content": "hi"}
+        ]
+    });
+    let mut request = engine
+        .decode_request(WireFormat::OpenAiChat, &body, &policy)?
+        .request;
+
+    prepare_request_for_target(
+        &mut request,
+        &"selected/model".into(),
+        Some("target prompt"),
+    );
+
+    assert!(request.preservation.requests.is_empty());
+    let encoded = engine
+        .encode_request(WireFormat::OpenAiChat, &request, &policy)?
+        .body;
+    assert_eq!(encoded["model"], "selected/model");
+    assert_eq!(encoded["messages"][0]["content"], "target prompt");
+    assert_eq!(encoded["messages"][1]["content"], "client prompt");
+    assert!(encoded["messages"][1].get("name").is_none());
+    Ok(())
+}
+
+// Model-only preparation retains provider fields while aligning exact replay with the target.
+#[test]
+fn preparing_without_a_prompt_preserves_exact_replay() -> TestResult {
+    let engine = TranslationEngine::default();
+    let policy = TranslationPolicy::default();
+    let body = json!({
+        "model": "route",
+        "messages": [{"role": "user", "content": "hi"}],
+        "provider_field": true
+    });
+    let mut request = engine
+        .decode_request(WireFormat::OpenAiChat, &body, &policy)?
+        .request;
+
+    prepare_request_for_target(&mut request, &"selected/model".into(), None);
+
+    assert_eq!(request.model.as_deref(), Some("selected/model"));
+    let preserved = &request.preservation.requests[&WireFormat::OpenAiChat.into()];
+    assert_eq!(preserved["model"], "selected/model");
+    assert_eq!(preserved["provider_field"], true);
+    let encoded = engine
+        .encode_request(WireFormat::OpenAiChat, &request, &policy)?
+        .body;
+    assert_eq!(encoded["model"], "selected/model");
+    assert_eq!(encoded["provider_field"], true);
+
+    let custom_format = FormatId::new("custom");
+    request
+        .preservation
+        .requests
+        .insert(custom_format.clone(), json!({"vendor_model": "route"}));
+    prepare_request_for_target(&mut request, &"fallback/model".into(), None);
+    assert_eq!(
+        request.preservation.requests[&WireFormat::OpenAiChat.into()]["model"],
+        "fallback/model"
+    );
+    assert!(!request.preservation.requests.contains_key(&custom_format));
+    Ok(())
+}
 
 // Verifies Anthropic-only request fields are dropped or mapped for OpenAI Chat.
 #[test]
@@ -285,12 +359,17 @@ fn anthropic_unknown_content_does_not_leak_into_responses_request_blocks() -> Te
 #[test]
 fn anthropic_tool_result_followup_text_splits_to_openai_messages() -> TestResult {
     let engine = TranslationEngine::default();
+    let raw_id = "functions.list_skills:0";
     let body = json!({
         "model": "claude-sonnet-4-20250514",
         "messages": [{
             "role": "user",
             "content": [
-                {"type": "tool_result", "tool_use_id": "toolu_1", "content": "72F"},
+                {
+                    "type": "tool_result",
+                    "tool_use_id": sanitize_anthropic_tool_use_id(raw_id),
+                    "content": "72F"
+                },
                 {"type": "text", "text": "Now summarize it."}
             ]
         }],
@@ -309,7 +388,7 @@ fn anthropic_tool_result_followup_text_splits_to_openai_messages() -> TestResult
     assert_eq!(
         output["messages"],
         json!([
-            {"role": "tool", "tool_call_id": "toolu_1", "content": "72F"},
+            {"role": "tool", "tool_call_id": raw_id, "content": "72F"},
             {"role": "user", "content": "Now summarize it."}
         ])
     );
@@ -732,13 +811,18 @@ fn responses_unknown_input_item_is_preserved_for_openai_chat() -> TestResult {
     Ok(())
 }
 
-// Responses accepts message-shaped input items without an explicit discriminator.
+// Responses accepts message-shaped input items without an explicit discriminator, and inline
+// system and developer items keep their roles instead of being demoted to user.
 #[test]
-fn responses_input_message_without_type_translates_normally() -> TestResult {
+fn responses_input_messages_translate_with_instruction_roles_intact() -> TestResult {
     let engine = TranslationEngine::default();
     let body = json!({
         "model": "gpt-4",
-        "input": [{"role": "user", "content": "hello"}]
+        "input": [
+            {"type": "message", "role": "system", "content": "Be terse."},
+            {"type": "message", "role": "developer", "content": "Return JSON only."},
+            {"role": "user", "content": "hello"}
+        ]
     });
 
     let output = engine
@@ -752,8 +836,43 @@ fn responses_input_message_without_type_translates_normally() -> TestResult {
 
     assert_eq!(
         output["messages"],
-        json!([{"role": "user", "content": "hello"}])
+        json!([
+            {"role": "system", "content": "Be terse."},
+            {"role": "developer", "content": "Return JSON only."},
+            {"role": "user", "content": "hello"}
+        ])
     );
+    Ok(())
+}
+
+// Inline instruction items must not detach pending reasoning from the assistant
+// turn that produced it.
+#[test]
+fn responses_inline_instruction_does_not_detach_reasoning() -> TestResult {
+    let engine = TranslationEngine::default();
+    let body = json!({
+        "model": "gpt-4",
+        "input": [
+            {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "thinking..."}], "summary": []},
+            {"type": "message", "role": "system", "content": "Be terse."},
+            {"type": "message", "role": "assistant", "content": "hello"}
+        ]
+    });
+
+    let output = engine
+        .translate_request(
+            WireFormat::OpenAiResponses,
+            WireFormat::OpenAiChat,
+            &body,
+            &TranslationPolicy::default(),
+        )?
+        .body;
+
+    assert_eq!(output["messages"].as_array().map(Vec::len), Some(2));
+    assert_eq!(output["messages"][0]["role"], "system");
+    assert_eq!(output["messages"][1]["role"], "assistant");
+    assert_eq!(output["messages"][1]["content"], "hello");
+    assert_eq!(output["messages"][1]["reasoning"], "thinking...");
     Ok(())
 }
 
@@ -1819,12 +1938,16 @@ fn openai_tool_results_are_merged_when_translating_to_anthropic() -> TestResult 
 
     assert_eq!(
         output["messages"][1]["content"][0]["id"],
-        "call_bad_id_with_space"
+        sanitize_anthropic_tool_use_id("call.bad:id/with space")
     );
     assert_eq!(
         output["messages"][2]["content"],
         json!([
-            {"type": "tool_result", "tool_use_id": "call_bad_id_with_space", "content": "one"},
+            {
+                "type": "tool_result",
+                "tool_use_id": sanitize_anthropic_tool_use_id("call.bad:id/with space"),
+                "content": "one"
+            },
             {"type": "tool_result", "tool_use_id": "call_2", "content": "two"}
         ])
     );
@@ -2092,6 +2215,7 @@ fn responses_to_chat_preserves_tool_choice_when_tools_survive() -> TestResult {
 #[test]
 fn anthropic_tool_use_encodes_responses_arguments_as_json_string() -> TestResult {
     let engine = TranslationEngine::default();
+    let raw_id = "functions.list_skills:0";
     let body = json!({
         "model": "claude-sonnet",
         "messages": [
@@ -2100,7 +2224,7 @@ fn anthropic_tool_use_encodes_responses_arguments_as_json_string() -> TestResult
                 "role": "assistant",
                 "content": [{
                     "type": "tool_use",
-                    "id": "toolu_1",
+                    "id": sanitize_anthropic_tool_use_id(raw_id),
                     "name": "get_weather",
                     "input": {"city": "SF"}
                 }]
@@ -2126,6 +2250,7 @@ fn anthropic_tool_use_encodes_responses_arguments_as_json_string() -> TestResult
     let arguments = call["arguments"]
         .as_str()
         .ok_or("function_call arguments must be a JSON string")?;
+    assert_eq!(call["call_id"], raw_id);
     assert_eq!(
         serde_json::from_str::<Value>(arguments)?,
         json!({"city": "SF"})

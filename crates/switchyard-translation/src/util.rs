@@ -5,12 +5,14 @@
 
 use std::collections::BTreeMap;
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Map, Value, json};
+use switchyard_protocol::ModelId;
 
 use crate::diagnostic::TranslationDiagnostic;
 use crate::error::{Result, TranslationError};
-use crate::format::FormatId;
-use crate::llm::{ContentBlock, LlmRequest, Message, PreservationMetadata};
+use crate::format::{FormatId, WireFormat};
+use crate::llm::{ContentBlock, InstructionBlock, LlmRequest, Message, PreservationMetadata, Role};
 use crate::policy::{
     LossyConversionPolicy, PreservationPolicy, TranslationPolicy, UnknownFieldPolicy,
 };
@@ -19,6 +21,8 @@ use crate::policy::{
 pub const SWITCHYARD_METADATA_KEY: &str = "_switchyard_translation";
 /// Public alias for the embedded preservation metadata key.
 pub const PRESERVATION_METADATA_KEY: &str = SWITCHYARD_METADATA_KEY;
+
+const ANTHROPIC_TOOL_ID_ENCODING_PREFIX: &str = "sy64_";
 
 /// Reads a JSON object or returns a typed translation error at the given path.
 pub fn object<'a>(value: &'a Value, path: &str) -> Result<&'a Map<String, Value>> {
@@ -271,6 +275,48 @@ pub fn exact_preserved_response(
         .flatten()
 }
 
+/// Applies a selected target model and optionally prepends its system prompt.
+///
+/// Model-only preparation restamps built-in preserved bodies so exact replay uses the target.
+/// Adding a prompt invalidates preserved bodies because they predate that content mutation.
+/// Call this once per candidate using a request that has not already received a target prompt.
+pub fn prepare_request_for_target(
+    request: &mut LlmRequest,
+    target: &ModelId,
+    prompt: Option<&str>,
+) {
+    let target = target.to_string();
+    request.model = Some(target.clone());
+    if let Some(prompt) = prompt {
+        request.instructions.insert(
+            0,
+            InstructionBlock {
+                role: Role::System,
+                content: vec![ContentBlock::Text {
+                    text: prompt.to_string(),
+                }],
+            },
+        );
+        request.preservation.requests.clear();
+    } else {
+        stamp_preserved_request_models(&mut request.preservation, &target);
+    }
+}
+
+// Retains exact replay only where the built-in wire model field can be updated safely.
+fn stamp_preserved_request_models(preservation: &mut PreservationMetadata, target: &str) {
+    preservation.requests.retain(|format, body| {
+        let is_builtin = format.as_str() == WireFormat::OpenAiChat.as_str()
+            || format.as_str() == WireFormat::OpenAiResponses.as_str()
+            || format.as_str() == WireFormat::AnthropicMessages.as_str();
+        let Some(body) = is_builtin.then_some(body).and_then(Value::as_object_mut) else {
+            return false;
+        };
+        body.insert("model".to_string(), Value::String(target.to_string()));
+        true
+    });
+}
+
 /// Embeds preservation metadata into a translated wire body when requested.
 pub fn embed_preservation(
     mut body: Value,
@@ -327,23 +373,33 @@ pub fn normalize_anthropic_tool_use_ids(value: Value) -> Value {
     }
 }
 
-/// Converts a single ID into Anthropic-safe characters.
+/// Converts an ID into a reversible Anthropic-safe representation.
 pub fn sanitize_anthropic_tool_use_id(raw: &str) -> String {
-    let sanitized = raw
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    if sanitized.is_empty() {
-        "toolu_empty".to_string()
-    } else {
-        sanitized
+    let is_safe = !raw.is_empty()
+        && raw
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
+    if is_safe && !raw.starts_with(ANTHROPIC_TOOL_ID_ENCODING_PREFIX) {
+        return raw.to_string();
     }
+
+    format!(
+        "{ANTHROPIC_TOOL_ID_ENCODING_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(raw.as_bytes())
+    )
+}
+
+/// Restores an ID encoded by [`sanitize_anthropic_tool_use_id`].
+pub(crate) fn desanitize_anthropic_tool_use_id(encoded: &str) -> String {
+    let Some(payload) = encoded.strip_prefix(ANTHROPIC_TOOL_ID_ENCODING_PREFIX) else {
+        return encoded.to_string();
+    };
+
+    URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_else(|| encoded.to_string())
 }
 
 // Normalizes every content block in one Anthropic message.
@@ -440,4 +496,38 @@ fn stable_suffix(raw: &str) -> String {
         hash = hash.wrapping_mul(1099511628211);
     }
     format!("{hash:08x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{desanitize_anthropic_tool_use_id, sanitize_anthropic_tool_use_id};
+
+    // Keeps ordinary provider IDs unchanged while making unsafe IDs reversible.
+    #[test]
+    fn anthropic_tool_id_encoding_round_trips() {
+        assert_eq!(
+            sanitize_anthropic_tool_use_id("call_abc-123"),
+            "call_abc-123"
+        );
+
+        for raw in ["", "functions.list_skills:0", "工具/lookup"] {
+            let encoded = sanitize_anthropic_tool_use_id(raw);
+            assert!(
+                encoded
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+            );
+            assert_eq!(desanitize_anthropic_tool_use_id(&encoded), raw);
+        }
+    }
+
+    // Escapes the reserved prefix and leaves malformed encoded values untouched.
+    #[test]
+    fn anthropic_tool_id_encoding_disambiguates_its_prefix() {
+        let raw = "sy64_Zm9v";
+        let encoded = sanitize_anthropic_tool_use_id(raw);
+        assert_ne!(encoded, raw);
+        assert_eq!(desanitize_anthropic_tool_use_id(&encoded), raw);
+        assert_eq!(desanitize_anthropic_tool_use_id("sy64_%%%"), "sy64_%%%");
+    }
 }

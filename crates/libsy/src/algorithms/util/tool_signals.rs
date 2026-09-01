@@ -100,6 +100,7 @@ static EDIT_TOOL_NAMES: &[&str] = &[
     "notebookedit",
     "str_replace",
     "str_replace_based_edit_tool",
+    "apply_patch", // codex's edit tool
     "text_editor",
     "patch", // hermes's str_replace-style edit tool
 ];
@@ -124,6 +125,10 @@ static BASH_WRITE_PATTERNS: &[&str] = &[
     "<<'eof'",
     "<< eof",
 ];
+
+/// Python file-write expressions, which only indicate a write when an
+/// interpreter is running them rather than a search looking for them.
+static PYTHON_WRITE_PATTERNS: &[&str] = &["write_text(", "writelines(", ".write("];
 
 static BASH_EDIT_PATTERNS: &[&str] = &[
     "sed -i",
@@ -160,6 +165,7 @@ static BASH_TOOL_NAMES: &[&str] = &[
     "shell",
     "local_shell_call",
     "terminal",
+    "exec_command", // codex
 ];
 
 // Prefer false negatives: tests_passed routes the picker to EFFICIENT, so a false
@@ -291,7 +297,7 @@ impl Default for ToolSignalProcessor {
 #[async_trait]
 impl Processor<State> for ToolSignalProcessor {
     async fn process(&self, state: &mut State, event: Event<'_>) -> Result<()> {
-        if let Event::Request(req) = event {
+        if let Event::Request { request: req, .. } = event {
             let tool_signal = ToolSignals::from_request(req, Some(self.recent_window));
             state.tool_signals = Some(tool_signal);
         }
@@ -318,6 +324,9 @@ fn classify_tool_call(name: &str, command: Option<&str>) -> ToolCategory {
     {
         // Write/edit redirection trumps read-like operands.
         if BASH_WRITE_PATTERNS.iter().any(|p| cmd.contains(p)) {
+            return ToolCategory::Write;
+        }
+        if cmd.contains("python") && PYTHON_WRITE_PATTERNS.iter().any(|p| cmd.contains(p)) {
             return ToolCategory::Write;
         }
         if BASH_EDIT_PATTERNS.iter().any(|p| cmd.contains(p)) {
@@ -388,10 +397,32 @@ const COMPACTION_MARKER: &str = "session is being continued";
 /// The shell command a tool call carries, when it has one. Harnesses name the
 /// field `command`; anything else is a tool whose category comes from its name.
 fn command_of(arguments: &Value) -> Option<String> {
-    arguments
-        .get("command")
-        .and_then(Value::as_str)
-        .map(str::to_lowercase)
+    // the Responses wire format sends arguments as a JSON string, not an object
+    let decoded = arguments
+        .as_str()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
+    let object = decoded.as_ref().unwrap_or(arguments);
+
+    ["command", "cmd", "input"]
+        .iter()
+        .filter_map(|key| object.get(*key))
+        .find_map(command_text)
+}
+
+/// A command field as lowercase text, from a string or an argv array.
+fn command_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.to_lowercase()),
+        Value::Array(parts) => {
+            let joined = parts
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ");
+            (!joined.is_empty()).then(|| joined.to_lowercase())
+        }
+        _ => None,
+    }
 }
 
 /// Text carried by a content block, ignoring the non-textual kinds.
@@ -795,6 +826,57 @@ mod tests {
         assert_eq!(sig.edit_count, 1);
         assert_eq!(sig.recent_write_count, 2);
         assert_eq!(sig.recent_edit_count, 1);
+    }
+
+    #[test]
+    fn codex_apply_patch_counts_as_an_edit() {
+        let request = with_messages(vec![tc("apply_patch"), tr("Success. Updated the file")]);
+        let sig = ToolSignals::from_request(&request, None);
+        assert_eq!(sig.edit_count, 1);
+        assert_eq!(sig.recent_edit_count, 1);
+    }
+
+    fn exec_command(cmd: Value) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolCall(ToolCall {
+                id: String::new(),
+                name: "exec_command".to_string(),
+                arguments: cmd,
+            })],
+        }
+    }
+
+    #[test]
+    fn codex_exec_command_is_classified() {
+        // arguments arrive as a JSON string, with the command under `cmd`
+        let args = json!(r#"{"cmd":"sed -i s/a/b/ src/lib.rs","workdir":"/x"}"#);
+        let request = with_messages(vec![exec_command(args), tr("ok")]);
+        assert_eq!(
+            ToolSignals::from_request(&request, None).recent_edit_count,
+            1
+        );
+    }
+
+    #[test]
+    fn python_write_expressions_need_a_python_command() {
+        let write = with_messages(vec![
+            exec_command(json!({"cmd": "python3 - <<'PY'\np.write_text(s)\nPY"})),
+            tr("ok"),
+        ]);
+        assert_eq!(
+            ToolSignals::from_request(&write, None).recent_write_count,
+            1
+        );
+
+        let search = with_messages(vec![
+            exec_command(json!({"cmd": "grep -R '.write(' src"})),
+            tr("ok"),
+        ]);
+        assert_eq!(
+            ToolSignals::from_request(&search, None).recent_write_count,
+            0
+        );
     }
 
     #[test]
