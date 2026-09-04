@@ -654,6 +654,47 @@ fn anthropic_tool_without_name_is_dropped_before_openai_chat() -> TestResult {
     Ok(())
 }
 
+// Verifies Anthropic tool strictness survives translation into both OpenAI formats.
+#[test]
+fn anthropic_tool_strictness_is_preserved_for_openai_formats() -> TestResult {
+    let engine = TranslationEngine::default();
+    let body = json!({
+        "model": "claude-sonnet-4-20250514",
+        "messages": [{"role": "user", "content": "Use a tool."}],
+        "max_tokens": 100,
+        "tools": [
+            {"name": "strict_tool", "input_schema": {}, "strict": true},
+            {"name": "non_strict_tool", "input_schema": {}, "strict": false},
+            {"name": "unspecified_tool", "input_schema": {}}
+        ]
+    });
+
+    let chat = engine
+        .translate_request(
+            WireFormat::AnthropicMessages,
+            WireFormat::OpenAiChat,
+            &body,
+            &TranslationPolicy::default(),
+        )?
+        .body;
+    let responses = engine
+        .translate_request(
+            WireFormat::AnthropicMessages,
+            WireFormat::OpenAiResponses,
+            &body,
+            &TranslationPolicy::default(),
+        )?
+        .body;
+
+    assert_eq!(chat["tools"][0]["function"]["strict"], true);
+    assert_eq!(chat["tools"][1]["function"]["strict"], false);
+    assert!(chat["tools"][2]["function"].get("strict").is_none());
+    assert_eq!(responses["tools"][0]["strict"], true);
+    assert_eq!(responses["tools"][1]["strict"], false);
+    assert!(responses["tools"][2].get("strict").is_none());
+    Ok(())
+}
+
 // Verifies OpenAI-compatible Anthropic extension fields are preserved.
 #[test]
 fn anthropic_openai_compatible_extensions_are_preserved_for_openai_chat() -> TestResult {
@@ -2432,5 +2473,52 @@ fn anthropic_image_encodes_as_responses_input_image_string() -> TestResult {
         .as_str()
         .ok_or("image_url must be a bare string, not a tagged ImageSource")?;
     assert_eq!(url, "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==");
+    Ok(())
+}
+
+// Verifies a flat Responses `input_file` decodes instead of being dropped.
+//
+// The Responses wire carries `file_data`/`filename` directly on the block, while
+// `decode_file_source` read a direct `file_id` but not a direct `file_data`, so a
+// Responses file fell through to `FileSource::Raw`. Chat's raw file encoder maps
+// only Anthropic `document` blocks and returns `None` otherwise -- so the file did
+// not merely lose its filename, it vanished from the request entirely.
+#[test]
+fn responses_flat_file_data_survives_into_chat() -> TestResult {
+    let engine = TranslationEngine::default();
+    let body = json!({
+        "model": "gpt-5.4-mini",
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "read this"},
+                {
+                    "type": "input_file",
+                    "file_data": "JVBERi0xLjQK",
+                    "filename": "report.pdf"
+                }
+            ]
+        }]
+    });
+
+    let output = engine
+        .translate_request(
+            WireFormat::OpenAiResponses,
+            WireFormat::OpenAiChat,
+            &body,
+            &TranslationPolicy::default(),
+        )?
+        .body;
+
+    let content = output["messages"][0]["content"]
+        .as_array()
+        .ok_or("Chat content should be an array")?;
+    let file = content
+        .iter()
+        .find(|block| block["type"] == "file")
+        .ok_or("the file must survive into Chat, not be dropped as unmappable raw")?;
+    assert_eq!(file["file"]["file_data"], "JVBERi0xLjQK");
+    assert_eq!(file["file"]["filename"], "report.pdf");
     Ok(())
 }
