@@ -301,6 +301,11 @@ impl ServerRunOptions {
 
 /// Validates the runtime and starts the HTTP server unless `dry_run` is set.
 pub async fn run_server(state: ServerState, options: ServerRunOptions) -> ServerResult<()> {
+    // ⛔ Before anything binds: a configured-but-unreadable base-instructions file must stop
+    // the server, not degrade to the stub. Placed ahead of the dry-run return so `--dry-run`
+    // reports it too — the deploy gate runs dry-run, and it is the cheapest place to catch it.
+    validate_base_instructions()?;
+
     if options.dry_run {
         println!("{}", dry_run_summary(&state));
         return Ok(());
@@ -1383,12 +1388,13 @@ fn error_response(
 }
 
 async fn models(State(state): State<ServerState>) -> Json<Value> {
-    Json(model_list_payload(
-        state
-            .runner
-            .models()
-            .map(|model| (model.id.as_str(), model.capabilities)),
-    ))
+    Json(model_list_payload(state.runner.models().map(|model| {
+        (
+            model.id.as_str(),
+            model.capabilities,
+            model.base_instructions,
+        )
+    })))
 }
 
 async fn get_stats(State(state): State<ServerState>) -> Json<StatsSnapshot> {
@@ -1469,20 +1475,25 @@ async fn not_found() -> Response {
 }
 
 fn model_list_payload<'a>(
-    entries: impl IntoIterator<Item = (&'a str, ModelCapabilities)>,
+    entries: impl IntoIterator<Item = (&'a str, ModelCapabilities, Option<&'a str>)>,
 ) -> Value {
     let mut entries = entries.into_iter().collect::<Vec<_>>();
-    entries.sort_unstable_by_key(|(model_id, _)| *model_id);
-    let model_ids = entries.iter().map(|(model, _)| *model).collect::<Vec<_>>();
+    entries.sort_unstable_by_key(|(model_id, _, _)| *model_id);
+    let model_ids = entries
+        .iter()
+        .map(|(model, _, _)| *model)
+        .collect::<Vec<_>>();
     let first_id = model_ids.first().copied();
     let last_id = model_ids.last().copied();
     json!({
         "object": "list",
-        "data": entries.iter().map(|(model, caps)| model_entry_json(model, *caps)).collect::<Vec<_>>(),
+        "data": entries.iter().map(|(model, caps, _)| model_entry_json(model, *caps)).collect::<Vec<_>>(),
         "models": entries
             .iter()
             .enumerate()
-            .map(|(priority, (model, caps))| codex_model_entry_json(model, *caps, priority))
+            .map(|(priority, (model, caps, base))| {
+                codex_model_entry_json(model, *caps, priority, *base)
+            })
             .collect::<Vec<_>>(),
         "first_id": first_id,
         "last_id": last_id,
@@ -1548,24 +1559,94 @@ fn model_entry_json(model: &str, capabilities: ModelCapabilities) -> Value {
 // The empty case REMOVES the key rather than sending `null` or `""`: the point is to say
 // nothing about base instructions, and a present-but-empty string is still a value to adopt.
 const BASE_INSTRUCTIONS_ENV: &str = "SWITCHYARD_BASE_INSTRUCTIONS";
+const BASE_INSTRUCTIONS_FILE_ENV: &str = "SWITCHYARD_BASE_INSTRUCTIONS_FILE";
 const BASE_INSTRUCTIONS_STUB: &str = "You are Codex, a coding agent.";
 
-fn base_instructions_override() -> Option<String> {
-    std::env::var(BASE_INSTRUCTIONS_ENV).ok()
+// `..._FILE` exists because the value worth serving is a real system prompt — Codex's own
+// bundled prompt is ~21 KB of multi-line markdown — and systemd `Environment=` cannot carry
+// that. Resolution order, most specific first:
+//
+//   1. the route's own `base_instructions` in routes.toml
+//   2. SWITCHYARD_BASE_INSTRUCTIONS_FILE   (deployment-wide, contents of the file)
+//   3. SWITCHYARD_BASE_INSTRUCTIONS        (deployment-wide, inline)
+//   4. the built-in stub
+//
+// At every level an EMPTY value means "advertise nothing", which omits the key.
+// ⛔ Omitting is nearly always the wrong choice against a real Codex: its catalog decoder
+// rejects an entry carrying neither `base_instructions` nor
+// `model_messages.instructions_template`, and because the model list decodes as one Vec, a
+// single omitted entry discards the WHOLE catalog — Codex warns to stderr and falls back to
+// default metadata, silently losing `input_modalities` and dropping images client-side.
+// The option is kept because it is the only way to say nothing, not because it is safe.
+static BASE_INSTRUCTIONS_FILE_VALUE: std::sync::OnceLock<Option<String>> =
+    std::sync::OnceLock::new();
+
+/// Reads the file named by `SWITCHYARD_BASE_INSTRUCTIONS_FILE`, if it is set.
+///
+/// Trailing newlines are trimmed so a file and an equivalent inline value advertise the
+/// same string. Returns `Err` when the variable names a file that cannot be read: a
+/// configured-but-missing prompt must stop the server, never degrade to the stub.
+fn read_base_instructions_file() -> Result<Option<String>, String> {
+    let path = match std::env::var(BASE_INSTRUCTIONS_FILE_ENV) {
+        Ok(path) if !path.is_empty() => path,
+        _ => return Ok(None),
+    };
+    read_base_instructions_path(&path).map(Some)
 }
 
-fn base_instructions_omitted() -> bool {
-    matches!(base_instructions_override().as_deref(), Some(""))
-}
-
-fn codex_base_instructions() -> String {
-    match base_instructions_override() {
-        Some(value) if !value.is_empty() => value,
-        _ => BASE_INSTRUCTIONS_STUB.to_string(),
+/// Reads one base-instructions file. Split out from the env lookup so the failure path is
+/// testable without mutating process-global environment under a parallel test runner.
+fn read_base_instructions_path(path: &str) -> Result<String, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text.trim_end_matches('\n').to_string()),
+        Err(error) => Err(format!(
+            "{BASE_INSTRUCTIONS_FILE_ENV} is set to {path}, which cannot be read: {error}"
+        )),
     }
 }
 
-fn codex_model_entry_json(model: &str, capabilities: ModelCapabilities, priority: usize) -> Value {
+/// Resolves and caches the base-instructions file once, so request handling stays
+/// infallible. Call this at startup: it is where a bad path is reported.
+fn validate_base_instructions() -> ServerResult<()> {
+    let value = read_base_instructions_file().map_err(ServerError::new)?;
+    let _ = BASE_INSTRUCTIONS_FILE_VALUE.set(value);
+    Ok(())
+}
+
+/// The deployment-wide value, file first and inline second.
+fn deployment_base_instructions() -> Option<String> {
+    if let Some(Some(value)) = BASE_INSTRUCTIONS_FILE_VALUE.get() {
+        return Some(value.clone());
+    }
+    std::env::var(BASE_INSTRUCTIONS_ENV).ok()
+}
+
+/// What a route should advertise, once route and deployment settings are combined.
+enum BaseInstructions {
+    /// Say nothing: remove the key from the catalog entry.
+    Omit,
+    /// Advertise this string verbatim.
+    Value(String),
+}
+
+fn resolve_base_instructions(route: Option<&str>) -> BaseInstructions {
+    let chosen = route
+        .map(str::to_string)
+        .or_else(deployment_base_instructions);
+    match chosen {
+        Some(value) if value.is_empty() => BaseInstructions::Omit,
+        Some(value) => BaseInstructions::Value(value),
+        None => BaseInstructions::Value(BASE_INSTRUCTIONS_STUB.to_string()),
+    }
+}
+
+fn codex_model_entry_json(
+    model: &str,
+    capabilities: ModelCapabilities,
+    priority: usize,
+    route_base_instructions: Option<&str>,
+) -> Value {
+    let base_instructions = resolve_base_instructions(route_base_instructions);
     // Codex is non-functional without shell and apply_patch, so an undeclared tool
     // capability defaults to enabled here; the OpenAI `data` entry reports the raw
     // Option separately for clients that want the undeclared state.
@@ -1587,7 +1668,10 @@ fn codex_model_entry_json(model: &str, capabilities: ModelCapabilities, priority
         "upgrade": null,
         // Required `ModelInfo` string. Unlike the launcher, the server cannot read
         // Codex's bundled prompt, so it sends a minimal stub.
-        "base_instructions": codex_base_instructions(),
+        "base_instructions": match &base_instructions {
+            BaseInstructions::Value(value) => Value::String(value.clone()),
+            BaseInstructions::Omit => Value::Null,
+        },
         "supports_reasoning_summaries": reasoning,
         "default_reasoning_summary": "none",
         "support_verbosity": reasoning,
@@ -1611,7 +1695,7 @@ fn codex_model_entry_json(model: &str, capabilities: ModelCapabilities, priority
         "supports_search_tool": false,
     });
     // Omit rather than blank: see BASE_INSTRUCTIONS_ENV above.
-    if base_instructions_omitted()
+    if matches!(base_instructions, BaseInstructions::Omit)
         && let Some(object) = entry.as_object_mut()
     {
         object.remove("base_instructions");
@@ -1728,6 +1812,66 @@ fn endpoint_listing(has_routing_log: bool) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    // A route's own `base_instructions` outrank any deployment-wide value. Asserted with an
+    // explicit route override, which short-circuits before the env is consulted, so this
+    // stays deterministic under a parallel runner.
+    #[test]
+    fn route_base_instructions_win_over_the_deployment_value() {
+        match resolve_base_instructions(Some("route-specific prompt")) {
+            BaseInstructions::Value(value) => assert_eq!(value, "route-specific prompt"),
+            BaseInstructions::Omit => panic!("a declared route value must be advertised"),
+        }
+    }
+
+    // An empty value at the winning level means "say nothing", which removes the key.
+    // ⛔ Against a real Codex this discards the WHOLE catalog, so the option exists to be
+    // possible, not to be safe. See the comment on BASE_INSTRUCTIONS_FILE_ENV.
+    #[test]
+    fn an_empty_route_value_omits_the_key_entirely() {
+        assert!(matches!(
+            resolve_base_instructions(Some("")),
+            BaseInstructions::Omit
+        ));
+        let entry = codex_model_entry_json("r", ModelCapabilities::default(), 0, Some(""));
+        let object = entry.as_object().expect("entry is an object");
+        assert!(
+            !object.contains_key("base_instructions"),
+            "an empty value must remove the key, not send an empty string"
+        );
+    }
+
+    // A declared route value reaches the served catalog entry verbatim.
+    #[test]
+    fn a_route_value_reaches_the_catalog_entry() {
+        let entry = codex_model_entry_json("r", ModelCapabilities::default(), 0, Some("hello"));
+        assert_eq!(entry["base_instructions"], serde_json::json!("hello"));
+    }
+
+    // ⛔ Fail closed: a configured file that cannot be read is an error, never a silent
+    // fallback to the stub. Silent degradation is the defect this whole option exists to
+    // avoid, so it gets its own test.
+    #[test]
+    fn an_unreadable_base_instructions_file_is_an_error() {
+        let error = read_base_instructions_path("/nonexistent/base-instructions.md")
+            .expect_err("a missing file must not resolve");
+        assert!(
+            error.contains("cannot be read"),
+            "error should name the failure, got: {error}"
+        );
+    }
+
+    // Trailing newlines are trimmed so a file and an equivalent inline value agree.
+    #[test]
+    fn a_base_instructions_file_is_read_without_its_trailing_newline() {
+        let dir = std::env::temp_dir().join("switchyard-base-instructions-test");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("prompt.md");
+        std::fs::write(&path, "line one\nline two\n").expect("write fixture");
+        let value = read_base_instructions_path(&path.to_string_lossy()).expect("readable");
+        assert_eq!(value, "line one\nline two");
+        let _ = std::fs::remove_file(&path);
+    }
     use switchyard_llm_client::LlmCallObservation;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{Notify, oneshot};

@@ -24,6 +24,9 @@ pub struct ModelInfo<'a> {
     pub id: &'a ModelId,
     pub algorithm: &'a str,
     pub capabilities: ModelCapabilities,
+    /// The route's own base instructions, when it declared any. Not a capability, so it
+    /// rides here rather than in `ModelCapabilities` (which stays `Copy`).
+    pub base_instructions: Option<&'a str>,
 }
 
 /// Fully resolved routing decision.
@@ -83,6 +86,7 @@ impl Runner {
             id,
             algorithm: route.algorithm_name(),
             capabilities: route.capabilities(),
+            base_instructions: route.base_instructions(),
         })
     }
 

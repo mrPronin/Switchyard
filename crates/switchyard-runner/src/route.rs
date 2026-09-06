@@ -125,6 +125,10 @@ pub struct Route {
     anthropic_auxiliary_target: Option<AuxiliaryTarget>,
     responses_auxiliary_target: Option<AuxiliaryTarget>,
     decision_targets: Vec<DecisionTarget>,
+    /// Base instructions this route advertises to a Codex client, overriding any
+    /// deployment-wide value. `Some("")` means "advertise nothing", which omits the
+    /// catalog key entirely rather than sending an empty string.
+    base_instructions: Option<String>,
 }
 
 /// The selected model and untouched response produced by a route execution.
@@ -152,7 +156,23 @@ impl Route {
             anthropic_auxiliary_target,
             responses_auxiliary_target,
             decision_targets,
+            base_instructions: None,
         }
+    }
+
+    /// Sets the route's own base instructions, overriding any deployment-wide value.
+    ///
+    /// A builder rather than a `new` parameter so the public constructor signature stays
+    /// as upstream has it, keeping this carry's merge surface to one line.
+    #[must_use]
+    pub fn with_base_instructions(mut self, base_instructions: Option<String>) -> Self {
+        self.base_instructions = base_instructions;
+        self
+    }
+
+    /// Returns the route's own base instructions, if it declared any.
+    pub fn base_instructions(&self) -> Option<&str> {
+        self.base_instructions.as_deref()
     }
 
     /// Returns the configured libsy algorithm name.

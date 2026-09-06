@@ -68,6 +68,9 @@ struct RouteConfig {
     tool_calling: Option<bool>,
     reasoning: Option<bool>,
     vision: Option<bool>,
+    /// Base instructions this route advertises to Codex, overriding the deployment-wide
+    /// value. An empty string means "advertise nothing" and omits the key.
+    base_instructions: Option<String>,
     algorithm: AlgorithmSpec,
 }
 
@@ -82,6 +85,7 @@ impl<'de> Deserialize<'de> for RouteConfig {
         let tool_calling = take_optional(&mut table, "tool_calling")?;
         let reasoning = take_optional(&mut table, "reasoning")?;
         let vision = take_optional(&mut table, "vision")?;
+        let base_instructions = take_optional(&mut table, "base_instructions")?;
         let algorithm = AlgorithmSpec::deserialize(toml::Value::Table(table))
             .map_err(serde::de::Error::custom)?;
         Ok(Self {
@@ -90,6 +94,7 @@ impl<'de> Deserialize<'de> for RouteConfig {
             tool_calling,
             reasoning,
             vision,
+            base_instructions,
             algorithm,
         })
     }
@@ -211,7 +216,8 @@ impl DeploymentConfig {
                 anthropic_auxiliary_target,
                 responses_auxiliary_target,
                 decision_targets,
-            );
+            )
+            .with_base_instructions(config.base_instructions.clone());
             routes.push((config.id.clone(), route));
         }
         let runner = Runner::new(routes).with_fallback_url(fallback_base_url);
@@ -1300,6 +1306,37 @@ weights = [1.0]
         .expect("route with vision should parse");
         assert_eq!(route.vision, Some(true));
         assert_eq!(route.capabilities().vision, Some(true));
+    }
+
+    // A route may carry its own `base_instructions`, which the server advertises instead of
+    // any deployment-wide value. Undeclared stays None so the deployment setting applies.
+    #[test]
+    fn route_base_instructions_are_undeclared_by_default_and_parse_when_set() {
+        let route: RouteConfig = toml::from_str(
+            r#"
+type = "random"
+id = "switchyard/random"
+targets = ["fast"]
+weights = [1.0]
+"#,
+        )
+        .expect("route without base_instructions should parse");
+        assert_eq!(route.base_instructions, None);
+
+        let route: RouteConfig = toml::from_str(
+            r#"
+type = "random"
+id = "switchyard/random"
+base_instructions = "You are a careful assistant."
+targets = ["fast"]
+weights = [1.0]
+"#,
+        )
+        .expect("route with base_instructions should parse");
+        assert_eq!(
+            route.base_instructions.as_deref(),
+            Some("You are a careful assistant.")
+        );
     }
 
     #[test]
