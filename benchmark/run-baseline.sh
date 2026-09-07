@@ -477,6 +477,20 @@ if [[ "${SWITCHYARD_ENABLED}" -eq 1 ]]; then
     SERVER_METRICS_URL="${SERVER_ROOT_URL}/metrics"
     SERVER_STATS_URL="${SERVER_ROOT_URL}/v1/stats"
 
+    # Refuse to start when something already answers on the control URL. Whatever holds
+    # the port will answer /health and /v1/stats plausibly -- an ssh -L forward to another
+    # Switchyard does both -- so the health gate passes, the run proceeds over the Docker
+    # network alias, and the captured metrics and routing stats are the foreign server's
+    # (all zeros for an idle one) with no warning anywhere.
+    # An explicit --server-url means the caller is attaching to a server they manage, so
+    # something answering there is expected; only guard the port this script binds itself.
+    if [[ -z "${SERVER_URL}" ]] \
+        && curl -fsS --max-time 2 "${SERVER_HEALTH_URL}" >/dev/null 2>&1; then
+        die "something already answers ${SERVER_HEALTH_URL} before the benchmark server started;
+free the port or pass --port N. Its stats would be captured instead of this run's.
+Holder: $(lsof -nP -iTCP:"${PORT}" -sTCP:LISTEN 2>/dev/null | awk 'NR==2 {print $1, "pid", $2}')"
+    fi
+
     if [[ -z "${HARBOR_SERVER_URL}" ]]; then
         HARBOR_SERVER_URL="http://${SWITCHYARD_DOCKER_SERVICE_NAME}:${PORT}"
     fi

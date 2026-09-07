@@ -107,7 +107,11 @@ def _build_codex_model_catalog(
 ) -> dict[str, list[dict[str, Any]]]:
     """Build Codex catalog JSON for Switchyard route ids."""
     template = _load_codex_model_template(codex_bin)
+    # The harvested template comes from whatever Codex is on PATH, which need not be
+    # the pinned Codex that later parses the catalog. Newer builds have dropped these
+    # two keys from their bundled metadata while older ones still require them.
     template.setdefault("supports_reasoning_summaries", True)
+    template.setdefault("supports_parallel_tool_calls", True)
     models: list[dict[str, Any]] = []
     for priority, (model_id, display_name, description) in enumerate(entries):
         model = copy.deepcopy(template)
