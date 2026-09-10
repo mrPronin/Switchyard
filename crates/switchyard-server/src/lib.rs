@@ -124,6 +124,7 @@ struct DecisionTargetResponse {
     model: ModelId,
     llm_client: DecisionLlmClientResponse,
     extra_body: BTreeMap<String, Value>,
+    extra_body_override: BTreeMap<String, Value>,
 }
 
 /// Non-secret client settings needed to call a selected model.
@@ -261,6 +262,7 @@ impl ServerState {
                 base_url: target.base_url,
             },
             extra_body: target.extra_body,
+            extra_body_override: target.extra_body_override,
         };
         Some(DecisionResponse {
             selected: convert(description.selected),

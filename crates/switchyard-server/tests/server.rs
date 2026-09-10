@@ -498,6 +498,7 @@ fn random_state_with_retries(
         forward_auth: false,
         extra_headers: BTreeMap::new(),
         extra_body: BTreeMap::new(),
+        extra_body_override: BTreeMap::new(),
         max_retries,
     });
     let target_models = routes
@@ -1173,6 +1174,7 @@ escalation = {{ confirmations = 1 }}
                     "base_url": model_upstream.base_url,
                 },
                 "extra_body": {"service_tier": "priority"},
+                "extra_body_override": {},
             },
             "fallbacks": [{
                 "target": "quality",
@@ -1182,6 +1184,7 @@ escalation = {{ confirmations = 1 }}
                     "base_url": model_upstream.base_url,
                 },
                 "extra_body": {},
+                "extra_body_override": {},
             }],
         })
     );

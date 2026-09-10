@@ -149,6 +149,7 @@ impl DeploymentConfig {
             format: client.format.wire_format(),
             base_url: client.base_url.as_str().to_string(),
             extra_body: target.extra_body.clone(),
+            extra_body_override: target.extra_body_override.clone(),
         })
     }
 
@@ -233,7 +234,7 @@ impl DeploymentConfig {
 
         for (name, client_config) in &self.llm_clients {
             validate_value("llm client name", name)?;
-            build_backend(name, client_config, &BTreeMap::new())?;
+            build_backend(name, client_config, &BTreeMap::new(), &BTreeMap::new())?;
         }
         for (target_name, target) in &self.targets {
             let client_config = self.llm_clients.get(&target.llm_client).ok_or_else(|| {
@@ -250,7 +251,12 @@ impl DeploymentConfig {
             model_configs.push(
                 ModelConfig::new(
                     target.id.clone(),
-                    build_backend(&target.llm_client, client_config, &target.extra_body)?,
+                    build_backend(
+                        &target.llm_client,
+                        client_config,
+                        &target.extra_body,
+                        &target.extra_body_override,
+                    )?,
                     None,
                 )
                 .with_responses_reasoning(client_config.responses_reasoning.unwrap_or_default())
@@ -441,6 +447,15 @@ struct TargetConfig {
     llm_client: String,
     #[serde(default)]
     extra_body: BTreeMap<String, Value>,
+    /// Top-level request fields that WIN over the caller's, merged object-wise.
+    ///
+    /// ⛔ Use this, not `extra_body`, for anything the CALLER also sends — reasoning
+    /// effort above all. `extra_body` fills an absent key only, and a caller that sends
+    /// `reasoning` at all keeps its own value for the whole key, so a per-target effort
+    /// written there never reaches the model (Codex sends `reasoning` on every Responses
+    /// request and offers no way to omit it).
+    #[serde(default)]
+    extra_body_override: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -473,6 +488,7 @@ fn build_backend(
     client_name: &str,
     config: &LlmClientConfig,
     extra_body: &BTreeMap<String, Value>,
+    extra_body_override: &BTreeMap<String, Value>,
 ) -> RunnerResult<Backend> {
     if config.max_retries > MAX_CONFIGURED_RETRIES {
         return Err(RunnerError::configuration(format!(
@@ -522,6 +538,7 @@ fn build_backend(
         forward_auth: config.forward_auth,
         extra_headers: config.extra_headers.clone(),
         extra_body: extra_body.clone(),
+        extra_body_override: extra_body_override.clone(),
         max_retries: config.max_retries,
     };
     let backend = match config.format {
@@ -1215,7 +1232,12 @@ target = "azure"
         let Some(client) = config.llm_clients.get("primary") else {
             return Err(RunnerError::configuration("primary llm client is missing"));
         };
-        let backend = build_backend("primary", client, &target.extra_body)?;
+        let backend = build_backend(
+            "primary",
+            client,
+            &target.extra_body,
+            &target.extra_body_override,
+        )?;
 
         assert_eq!(
             backend.extra_body().get("service_tier"),
@@ -1228,6 +1250,42 @@ target = "azure"
                 .and_then(|value| value.get("enable_thinking")),
             Some(&json!(false))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn target_extra_body_override_is_parsed_and_applied_to_its_backend() -> RunnerResult<()> {
+        let configured = VALID_CONFIG.replacen(
+            "llm_client = \"primary\"",
+            "llm_client = \"primary\"\n\
+             extra_body_override = { reasoning = { effort = \"xhigh\" } }",
+            1,
+        );
+        let config: DeploymentConfig = toml::from_str(&configured).map_err(|error| {
+            RunnerError::configuration(format!("failed to parse config: {error}"))
+        })?;
+        let Some(target) = config.targets.get("classifier") else {
+            return Err(RunnerError::configuration("classifier target is missing"));
+        };
+        let Some(client) = config.llm_clients.get("primary") else {
+            return Err(RunnerError::configuration("primary llm client is missing"));
+        };
+        let backend = build_backend(
+            "primary",
+            client,
+            &target.extra_body,
+            &target.extra_body_override,
+        )?;
+
+        assert_eq!(
+            backend
+                .extra_body_override()
+                .get("reasoning")
+                .and_then(|value| value.get("effort")),
+            Some(&json!("xhigh"))
+        );
+        // The two maps stay separate: an override is not also a default.
+        assert!(backend.extra_body().is_empty());
         Ok(())
     }
 

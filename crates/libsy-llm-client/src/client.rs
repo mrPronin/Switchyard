@@ -285,6 +285,11 @@ impl TranslatingLlmClient {
                 .normalize(&mut body);
         }
         merge_extra_body(&mut body, backend.extra_body());
+        // ⛔ AFTER `merge_extra_body`, because this map is the one that WINS. A caller
+        // that sends `reasoning` at all keeps its own value through `merge_extra_body`,
+        // which is how per-target reasoning effort came to be silently inert for any
+        // caller that always sends the field (Codex does, with no way to omit it).
+        override_extra_body(&mut body, backend.extra_body_override());
         if matches!(backend, Backend::Anthropic(_)) {
             enable_anthropic_prompt_caching(&mut body);
         }
@@ -861,6 +866,42 @@ fn merge_extra_body(body: &mut Value, extra_body: &BTreeMap<String, Value>) {
     }
 }
 
+// Applies target settings that OVERRIDE the fields supplied by the caller.
+//
+// Object values merge one level at a time so a nested override replaces only the leaves
+// it names: `{reasoning: {effort: "xhigh"}}` over a caller's
+// `{reasoning: {effort: "medium", summary: "auto"}}` yields
+// `{reasoning: {effort: "xhigh", summary: "auto"}}`, leaving a sibling the caller needs
+// (`summary`, `context`) intact. A non-object value replaces the caller's outright.
+fn override_extra_body(body: &mut Value, extra_body_override: &BTreeMap<String, Value>) {
+    let Value::Object(object) = body else {
+        return;
+    };
+    for (key, value) in extra_body_override {
+        match (object.get_mut(key), value) {
+            (Some(Value::Object(target)), Value::Object(source)) => {
+                override_object(target, source);
+            }
+            _ => {
+                object.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+fn override_object(target: &mut Map<String, Value>, source: &Map<String, Value>) {
+    for (key, value) in source {
+        match (target.get_mut(key), value) {
+            (Some(Value::Object(nested_target)), Value::Object(nested_source)) => {
+                override_object(nested_target, nested_source);
+            }
+            _ => {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
 // Anthropic and Bedrock both cap a request at four blocks carrying
 // `cache_control`, counting tools, system blocks and message blocks together.
 const MAX_CACHE_CONTROL_BLOCKS: usize = 4;
@@ -969,6 +1010,7 @@ mod tests {
             forward_auth: false,
             extra_headers: BTreeMap::new(),
             extra_body: BTreeMap::new(),
+            extra_body_override: BTreeMap::new(),
             max_retries: 0,
         }
     }
@@ -995,6 +1037,17 @@ mod tests {
     ) -> Vec<ModelConfig> {
         let mut backend = config(base_url);
         backend.extra_body = extra_body;
+        vec![ModelConfig::new("gpt", Backend::OpenAiChat(backend), None)]
+    }
+
+    fn chat_map_with_extra_body_override(
+        base_url: &str,
+        extra_body: BTreeMap<String, Value>,
+        extra_body_override: BTreeMap<String, Value>,
+    ) -> Vec<ModelConfig> {
+        let mut backend = config(base_url);
+        backend.extra_body = extra_body;
+        backend.extra_body_override = extra_body_override;
         vec![ModelConfig::new("gpt", Backend::OpenAiChat(backend), None)]
     }
 
@@ -1504,9 +1557,64 @@ mod tests {
         Ok(())
     }
 
+    /// ⭐ The point of `extra_body_override`: a per-target setting the caller cannot
+    /// discard. `extra_body` yields to the caller for the WHOLE key, so a per-target
+    /// `reasoning.effort` was inert against any caller that sends `reasoning` at all --
+    /// Codex sends it on every Responses request and offers no way to omit it.
+    #[tokio::test]
+    async fn extra_body_override_replaces_the_request_and_keeps_sibling_keys()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "model": "gpt",
+                // The override replaced the caller's effort and left the sibling the
+                // caller sent in place.
+                "reasoning": {"effort": "xhigh", "summary": "auto"},
+                // A plain `extra_body` default still yields to the caller.
+                "service_tier": "priority"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1",
+                "model": "gpt",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map_with_extra_body_override(
+            &format!("{}/v1", server.uri()),
+            BTreeMap::from([("service_tier".to_string(), json!("flex"))]),
+            BTreeMap::from([("reasoning".to_string(), json!({"effort": "xhigh"}))]),
+        ))?;
+        let raw = json!({
+            "model": "client-facing",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning": {"effort": "medium", "summary": "auto"},
+            "service_tier": "priority"
+        });
+
+        client
+            .call_rewrite_model_raw(
+                raw,
+                None,
+                Some(&ModelId::from("gpt")),
+                WireFormat::OpenAiChat,
+            )
+            .await?;
+        Ok(())
+    }
+
     // A weak OpenAI-format tier emits thinking blocks with no signature. Replaying
     // them to Anthropic is rejected (Bedrock reports it as a SigV4 mismatch), so
     // the Anthropic leg must drop them while keeping signed ones.
+
     #[tokio::test]
     async fn anthropic_requests_drop_unsigned_thinking_blocks()
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {

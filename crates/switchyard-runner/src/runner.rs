@@ -43,6 +43,7 @@ pub struct DecisionTarget {
     pub format: WireFormat,
     pub base_url: String,
     pub extra_body: BTreeMap<String, Value>,
+    pub extra_body_override: BTreeMap<String, Value>,
 }
 
 impl Runner {

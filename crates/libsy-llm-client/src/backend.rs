@@ -54,6 +54,17 @@ pub struct HttpBackendConfig {
     pub extra_headers: BTreeMap<String, String>,
     /// Default top-level request fields, applied only when the request omits the key.
     pub extra_body: BTreeMap<String, Value>,
+    /// Top-level request fields that WIN over the caller's, merged object-wise.
+    ///
+    /// ⛔ `extra_body` cannot express a per-target reasoning effort, because a caller
+    /// that sends `reasoning` at all keeps its own value for the whole key. Codex sends
+    /// `reasoning` on every Responses request and offers no way to omit it (measured
+    /// against 0.154.0: `effort` present with the key unset, with `none`, and with a
+    /// model catalogue declaring no reasoning support), so a route's per-target efforts
+    /// were silently discarded. This map is applied AFTER `extra_body` and overwrites,
+    /// so `{reasoning = {effort = "xhigh"}}` replaces the effort and leaves the sibling
+    /// keys the caller sent (`summary`, `context`) in place.
+    pub extra_body_override: BTreeMap<String, Value>,
     /// Additional attempts after the initial upstream request.
     pub max_retries: u32,
 }
@@ -66,6 +77,7 @@ impl fmt::Debug for HttpBackendConfig {
             .field("forward_auth", &self.forward_auth)
             .field("extra_header_names", &self.extra_headers.keys())
             .field("extra_body_keys", &self.extra_body.keys())
+            .field("extra_body_override_keys", &self.extra_body_override.keys())
             .field("max_retries", &self.max_retries)
             .finish()
     }
@@ -250,6 +262,11 @@ impl Backend {
         &self.config().extra_body
     }
 
+    /// Top-level fields that overwrite the caller's in outbound request bodies.
+    pub fn extra_body_override(&self) -> &BTreeMap<String, Value> {
+        &self.config().extra_body_override
+    }
+
     /// Additional attempts allowed after the initial request.
     pub fn max_retries(&self) -> u32 {
         self.config().max_retries
@@ -345,6 +362,7 @@ mod tests {
             forward_auth: false,
             extra_headers: BTreeMap::new(),
             extra_body: BTreeMap::new(),
+            extra_body_override: BTreeMap::new(),
             max_retries: 0,
         }
     }
