@@ -42,10 +42,31 @@ impl JudgePolicy for TargetSelectorPolicy {
     type Verdict = Value;
 
     fn to_classification(&self, verdict: Option<&Self::Verdict>) -> Classification {
-        let target = verdict
+        let label = verdict
             .and_then(|verdict| self.selector.resolve(verdict).ok())
-            .and_then(Value::as_str)
-            .and_then(|label| self.targets.get(label));
+            .and_then(Value::as_str);
+        let target = label.and_then(|label| self.targets.get(label));
+
+        // ⭐ THE VERDICT IS THE ONLY PLACE THE JUDGE EXPLAINS ITSELF, and until now it
+        // was dropped right here. A custom-mode schema usually carries a reason beside
+        // the routed label — mini-team's is `why` — and nothing downstream ever saw it:
+        // the routing log writes one row per completed RESPONSE (route, model, tier,
+        // tokens), so *which* member served is observable and *why that member* is not.
+        // With a judge biased toward one target, "it picked local again" and "it never
+        // understood the request" look identical without this line.
+        //
+        // ⚠ The WHOLE verdict, not a named field: this policy knows the selector and
+        // nothing else about the schema, so picking out `why` would be guessing at one
+        // deployment's shape. `label` is what the pointer resolved to, `routed` says
+        // whether it matched a configured target — an unroutable label is exactly the
+        // silent fail-open case that is otherwise invisible.
+        tracing::info!(
+            label = label.unwrap_or("<unresolved>"),
+            routed = target.is_some(),
+            verdict = %verdict.map_or_else(String::new, ToString::to_string),
+            "custom classifier verdict"
+        );
+
         match target {
             Some(target) => Classification::Scores(vec![Score {
                 target: target.clone(),
