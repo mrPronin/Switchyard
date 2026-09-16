@@ -35,6 +35,22 @@ impl ResponsesReasoningPolicy {
         let Some(object) = item.as_object_mut() else {
             return true;
         };
+
+        // ⛔ A Responses item that reaches an upstream without a `type` is rejected as
+        // "Cannot determine type of 'item'" — measured against llama.cpp 2026-09-16.
+        // A `{role, content}` item unambiguously IS a message, so name it rather than
+        // forward an unroutable shape; dropping it would delete conversation content.
+        //
+        // ⚠ This is reached when one provider's replayed output is sent to another,
+        // which is exactly what a tier switch does: a hosted turn's assistant items are
+        // replayed to a local model on the next turn and the whole request 400s.
+        // Measured asymmetry: a typeless item with `role: "user"` round-trips fine and
+        // only the assistant side loses its `type`, so this normalises the case that is
+        // actually broken rather than every item that omits the field.
+        if !object.contains_key("type") && object.contains_key("role") {
+            object.insert("type".to_string(), Value::from("message"));
+        }
+
         if object.get("type").and_then(Value::as_str) != Some("reasoning") {
             return true;
         }
@@ -97,6 +113,33 @@ mod tests {
                 .iter()
                 .any(|item| item["type"] == "function_call_output")
         );
+    }
+
+    #[test]
+    fn a_typeless_assistant_item_is_named_rather_than_forwarded() {
+        // Reached on a tier switch: a hosted turn's assistant output replayed to a
+        // local model. Without a `type` the upstream answers 400 and the turn dies.
+        let mut body = json!({
+            "input": [
+                {"role": "assistant", "content": [{"type": "output_text", "text": "hi"}]}
+            ]
+        });
+        ResponsesReasoningPolicy::Drop.normalize(&mut body);
+        assert_eq!(body["input"][0]["type"], "message");
+        assert_eq!(body["input"][0]["role"], "assistant");
+        assert_eq!(
+            body["input"][0]["content"][0]["text"], "hi",
+            "content must survive being named"
+        );
+    }
+
+    #[test]
+    fn an_item_that_already_has_a_type_is_left_alone() {
+        let mut body = json!({
+            "input": [{"type": "function_call", "call_id": "c1", "role": "assistant"}]
+        });
+        ResponsesReasoningPolicy::Drop.normalize(&mut body);
+        assert_eq!(body["input"][0]["type"], "function_call");
     }
 
     #[test]
