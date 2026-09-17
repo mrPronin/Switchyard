@@ -66,6 +66,7 @@ pub struct ModelConfig {
     other_backends: Option<Vec<Backend>>,
     responses_reasoning: crate::ResponsesReasoningPolicy,
     responses_tool_images: crate::ResponsesToolImagePolicy,
+    responses_custom_tools: crate::ResponsesCustomToolPolicy,
 }
 
 impl ModelConfig {
@@ -82,19 +83,28 @@ impl ModelConfig {
             other_backends,
             responses_reasoning: crate::ResponsesReasoningPolicy::default(),
             responses_tool_images: crate::ResponsesToolImagePolicy::default(),
+            responses_custom_tools: crate::ResponsesCustomToolPolicy::default(),
         }
     }
 
-    /// Sets how Responses reasoning items are replayed to this model.
-    #[must_use]
     /// Where an image returned by a TOOL is placed for this model's upstream.
+    #[must_use]
     pub fn with_responses_tool_images(mut self, policy: crate::ResponsesToolImagePolicy) -> Self {
         self.responses_tool_images = policy;
         self
     }
 
+    /// Sets how Responses reasoning items are replayed to this model.
+    #[must_use]
     pub fn with_responses_reasoning(mut self, policy: crate::ResponsesReasoningPolicy) -> Self {
         self.responses_reasoning = policy;
+        self
+    }
+
+    /// Sets how Responses CUSTOM (freeform) tool items are replayed to this model.
+    #[must_use]
+    pub fn with_responses_custom_tools(mut self, policy: crate::ResponsesCustomToolPolicy) -> Self {
+        self.responses_custom_tools = policy;
         self
     }
 }
@@ -273,6 +283,17 @@ impl TranslatingLlmClient {
             self.model_to_config
                 .get(model)
                 .map(|config| config.responses_reasoning)
+                .unwrap_or_default()
+                .normalize(&mut body);
+            // ⛔ BEFORE the tool-image pass: this rewrites `custom_tool_call_output` into
+            // `function_call_output`, which is exactly the shape that pass looks for, so the
+            // image policy sees a complete set of tool outputs rather than a partial one.
+            // Rejected as `400 "Cannot determine type of 'item'"` by upstreams that model only
+            // function tools (llama.cpp), and reached whenever a hosted turn's `apply_patch` is
+            // replayed to a local model.
+            self.model_to_config
+                .get(model)
+                .map(|config| config.responses_custom_tools)
                 .unwrap_or_default()
                 .normalize(&mut body);
             // ⛔ AFTER the reasoning pass and BEFORE `merge_extra_body`, so a target can still

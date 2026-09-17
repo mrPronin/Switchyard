@@ -13,7 +13,8 @@ use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use switchyard_llm_client::{
     AuxiliaryOperation, Backend, ClientRouter, DEFAULT_MAX_RETRIES, HttpBackendConfig, ModelConfig,
-    ResponsesReasoningPolicy, ResponsesToolImagePolicy, TranslatingLlmClient,
+    ResponsesCustomToolPolicy, ResponsesReasoningPolicy, ResponsesToolImagePolicy,
+    TranslatingLlmClient,
 };
 use switchyard_protocol::{ModelId, RoutedLlmClient, WireFormat};
 
@@ -262,6 +263,9 @@ impl DeploymentConfig {
                 .with_responses_reasoning(client_config.responses_reasoning.unwrap_or_default())
                 .with_responses_tool_images(
                     client_config.responses_tool_images.unwrap_or_default(),
+                )
+                .with_responses_custom_tools(
+                    client_config.responses_custom_tools.unwrap_or_default(),
                 ),
             );
         }
@@ -438,6 +442,12 @@ struct LlmClientConfig {
     /// (llama.cpp answers `400 "Output of tool call should be 'Input text'"`).
     /// Default `inline` keeps the caller's payload, which hosted providers accept.
     responses_tool_images: Option<ResponsesToolImagePolicy>,
+    /// How CUSTOM (freeform) tool items are replayed. `translate` rewrites
+    /// `custom_tool_call` / `custom_tool_call_output` as their `function_call` equivalents,
+    /// for upstreams that model only function tools (llama.cpp answers
+    /// `400 "Cannot determine type of 'item'"`). Default `preserve` sends the caller's
+    /// items, which hosted providers define.
+    responses_custom_tools: Option<ResponsesCustomToolPolicy>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -508,6 +518,11 @@ fn build_backend(
     if config.responses_reasoning.is_some() && config.format != ClientFormat::OpenAiResponses {
         return Err(RunnerError::configuration(format!(
             "llm client {client_name} responses_reasoning is only valid for openai_responses"
+        )));
+    }
+    if config.responses_custom_tools.is_some() && config.format != ClientFormat::OpenAiResponses {
+        return Err(RunnerError::configuration(format!(
+            "llm client {client_name} responses_custom_tools is only valid for openai_responses"
         )));
     }
     let api_key = config
@@ -1333,6 +1348,52 @@ target = "azure"
         assert!(
             error_message(&invalid)
                 .contains("responses_reasoning is only valid for openai_responses")
+        );
+    }
+
+    #[test]
+    fn responses_custom_tools_defaults_and_accepts_translate() -> RunnerResult<()> {
+        let default: DeploymentConfig = toml::from_str(VALID_CONFIG).map_err(|error| {
+            RunnerError::configuration(format!("failed to parse default config: {error}"))
+        })?;
+        let Some(responses) = default.llm_clients.get("responses") else {
+            return Err(RunnerError::configuration(
+                "responses llm client is missing",
+            ));
+        };
+        assert_eq!(responses.responses_custom_tools, None);
+
+        let configured = VALID_CONFIG.replacen(
+            "[llm_clients.responses]\nformat = \"openai_responses\"\nbase_url = \"https://example.test/v1\"",
+            "[llm_clients.responses]\nformat = \"openai_responses\"\nbase_url = \"https://example.test/v1\"\nresponses_custom_tools = \"translate\"",
+            1,
+        );
+        let config: DeploymentConfig = toml::from_str(&configured).map_err(|error| {
+            RunnerError::configuration(format!("failed to parse configured custom tools: {error}"))
+        })?;
+        let Some(responses) = config.llm_clients.get("responses") else {
+            return Err(RunnerError::configuration(
+                "responses llm client is missing",
+            ));
+        };
+        assert_eq!(
+            responses.responses_custom_tools,
+            Some(ResponsesCustomToolPolicy::Translate)
+        );
+        runner_from_toml(&configured)?;
+        Ok(())
+    }
+
+    #[test]
+    fn responses_custom_tools_rejects_other_formats() {
+        let invalid = VALID_CONFIG.replacen(
+            "format = \"openai_chat\"",
+            "format = \"openai_chat\"\nresponses_custom_tools = \"translate\"",
+            1,
+        );
+        assert!(
+            error_message(&invalid)
+                .contains("responses_custom_tools is only valid for openai_responses")
         );
     }
 
