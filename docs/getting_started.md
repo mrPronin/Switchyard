@@ -28,9 +28,11 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source "$HOME/.cargo/env"
 ```
 
-On macOS or native Windows, follow the
+For v0.3.0, the standalone server is release-validated on Ubuntu 24.04,
+Linux x86_64. Other platforms are outside the release-validation scope.
+
+If you try a source build on macOS or native Windows, follow the
 [official Rust installation instructions](https://rust-lang.org/tools/install/).
-The Rust installer includes `rustc`, Cargo, and `rustup`.
 
 Install `uv` for the repository's Python-based tooling and CI checks. It is not
 required to build or run the Rust server:
@@ -60,11 +62,24 @@ switchyard-server --help
 
 Cargo builds the release binary and installs it into `~/.cargo/bin` by default.
 
+#### Build from source
+
+Install the server from `main` to use unreleased features:
+
+```bash
+cargo install --locked \
+  --git https://github.com/NVIDIA-NeMo/Switchyard.git \
+  --branch main \
+  switchyard-server
+```
+
 ### Configure
 
 The Rust server reads an explicit TOML file.
 
-Create `routes.toml` with an LLM-classifier route:
+Create `routes.toml` with an auto route:
+
+> Requires unreleased features. [Build from source](#build-from-source) to run this example.
 
 ```toml
 schema_version = 1
@@ -84,12 +99,9 @@ llm_client = "openrouter"
 
 [routes.smart]
 id = "switchyard"
-type = "llm_classifier"
-mode = "capability"
-classifier_target = "weak"
-strong_target = "strong"
-weak_target = "weak"
-base_threshold = 0.5
+type = "auto"
+capable_target = "strong"
+efficient_target = "weak"
 ```
 
 `format` selects the upstream protocol and must be `openai_chat`,
@@ -99,8 +111,10 @@ A client can set `forward_auth = true` instead of `api_key_env` to send each
 caller's credential to that upstream. OpenAI clients forward `authorization`,
 `chatgpt-account-id`, and `x-openai-fedramp`. Anthropic clients forward
 `authorization` or `x-api-key`. Enable this only for an upstream that should
-receive the caller's login. The server rejects a forwarding route called
-through the other provider's API.
+receive the caller's login. All backends reachable through the route, including
+efficient and capable targets, must use the same provider. Other application
+headers are preserved, so they may contain provider-specific credentials. The
+server rejects a forwarding route called through the other provider's API.
 For a local `openai_responses` server that cannot replay provider-encrypted
 reasoning, set `responses_reasoning = "drop"`; hosted Responses clients default
 to `preserve_encrypted`.
@@ -134,14 +148,14 @@ curl http://localhost:4000/v1/chat/completions \
 
 #### Choose a route type
 
-This guide uses `llm_classifier`, which asks a classifier target whether each
-request should use the weak or strong target. The Rust server also supports:
+Start with **Auto**, as shown above. Choose Task or Execution when you want
+more control over how requests are routed.
 
-| Algorithm | Use it when | Config |
+| Choice | Use it when | Route `type` |
 |---|---|---|
-| [Random](routing_algorithms/random_routing.md) | You need a weighted split for A/B tests or baselines. | `random` |
-| [LLM classifier](routing_algorithms/llm_classifier_routing.md) | Request content should decide whether to use the weak or strong target. | `llm_classifier` |
-| [Stage router](routing_algorithms/stage_router_routing.md) | Tool-result and progress signals should select an efficient or capable target. | `stage_router` |
+| **[Auto](routing_algorithms/overview.md#auto)** | You want Switchyard's recommended preset. | `auto` |
+| **[Task](routing_algorithms/llm_classifier_routing.md)** | You want an LLM to judge which model can handle the task. | `llm_classifier` |
+| **[Execution](routing_algorithms/stage_router_routing.md)** | You want tool results and agent progress to guide each request. | `stage_router` |
 
 A single TOML file can declare multiple routes. The table key, such as
 `routes.smart`, is a local configuration name; each route's `id` is exposed as a
@@ -189,8 +203,8 @@ picks a target and hands the model call back to you.
 [dependencies]
 async-trait = "0.1"
 futures = "0.3"
-switchyard-libsy = { git = "https://github.com/NVIDIA-NeMo/Switchyard.git", tag = "v0.2.0" }
-switchyard-protocol = { git = "https://github.com/NVIDIA-NeMo/Switchyard.git", tag = "v0.2.0" }
+switchyard-libsy = { git = "https://github.com/NVIDIA-NeMo/Switchyard.git", tag = "v0.3.0" }
+switchyard-protocol = { git = "https://github.com/NVIDIA-NeMo/Switchyard.git", tag = "v0.3.0" }
 tokio = { version = "1", features = ["macros", "rt"] }
 ```
 
@@ -215,6 +229,17 @@ judge call your host performs over its own transport. The run ends with `Step::D
 response when routing already produced the answer. Otherwise the host makes the terminal answer
 call from that outcome. Serving these calls yourself is what lets libsy embed in a host that
 already owns its HTTP stack, retries, and credentials.
+
+Successful runs also include `OutcomeMetadata`: a unique `outcome_id`, the algorithm
+name, and optional JSON evidence. In Python, read `outcome.metadata.outcome_id`,
+`outcome.metadata.algorithm`, and `outcome.metadata.evidence` after checking that
+`outcome.metadata` is present. Evidence is a normal Python value, usually a dictionary;
+algorithms without evidence return `None`.
+
+With a host-installed OpenTelemetry subscriber, the existing `libsy.run` span records
+the same identity, selected models, and supported evidence fields. See
+the [OpenTelemetry reference](reference/opentelemetry.md) for field names, metrics,
+and export setup. libsy does not install an exporter or send telemetry itself.
 
 For the request, response, and streaming types the steps carry, see
 [`switchyard-protocol`](../crates/protocol/README.md).

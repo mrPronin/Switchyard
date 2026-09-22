@@ -8,10 +8,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`timeout_ms` on `[llm_clients.<name>]`** — one deadline covers all attempts,
+  retry delays, and the complete response, including stream reads. Unset leaves
+  the wait unbounded; `0` is rejected. A timeout returns `504` without trying another
+  model, or a framed error if the final answer has already started streaming.
+  Timed-out attempts are counted in metrics.
+- **Per-target `reasoning_effort`** — a target can force the reasoning effort
+  of every request it serves, replacing the caller's value (`reasoning.effort`
+  on the Responses wire, `reasoning_effort` on Chat Completions), so a strong
+  tier can run at `max` behind a client that sends `high`. `extra_body` only
+  fills absent keys and could not do this. Rejected on Anthropic clients.
+- **Raw Responses stream trace** — an opt-in trace of every upstream Responses
+  event as received, under `RUST_LOG=switchyard_translation::responses::raw=trace`,
+  for diagnosing provider-specific event shapes. (#646)
 - **NeMo Relay native plugin** — a dynamically loaded integration that loads
   Switchyard's standard TOML deployment and executes its `switchyard-runner`-
   supported configured routes in process. Managed calls require NeMo Relay
-  `>=0.8.1,<0.9.0`; unknown models use Relay's continuation unchanged.
+  `>=0.8.0, <1.0.0`; unknown models use Relay's continuation unchanged.
 
 - **NeMo Relay routing marks** — routing-model usage, measured routing
   overhead, and selected-model decisions are emitted as ATOF marks. The final
@@ -69,9 +82,68 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Hierarchical routing** — libsy adds hierarchical routing, with stages
   delegating to their own sub-router; a hierarchical stage router that
   carries its own judge is rejected. (#533)
+- **Upstream response headers forwarded** — the LLM client records the
+  upstream HTTP response headers on both the buffered and the streaming path,
+  and `switchyard-server` replays an allowlisted subset to the downstream
+  client: W3C tracing (`traceparent`, `tracestate`, `baggage`),
+  `x-request-id`, Anthropic's `request-id`, `openai-processing-ms`, and the
+  `anthropic-ratelimit-`, `x-ratelimit-`, and `x-upstream-` namespaces. Body
+  description, hop-by-hop, cookie, and Switchyard-owned headers are never
+  forwarded, and a header Switchyard writes itself always beats an upstream
+  echo of the same name. (#571)
+
+- **Per-target `system_prompt`** — a native target can configure
+  `system_prompt`, so the prompt follows the model that actually answers the
+  request instead of living only on Stage and Composite routes. (#464)
+- **`auto` algorithm type** — a deployment provides just `capable` and
+  `efficient` models and the recommended stage-router settings are used out
+  of the box; `auto` can be repointed at new strategies or defaults in the
+  future. (#654)
+- **Codex freeform tools and the Responses-lite request shape** — the
+  Responses codec understands the request shape Codex drives GPT-5 models
+  with and its freeform (`custom`) tools, so a GPT-5.x Codex session routes
+  natively and survives its first native-tool turn. (#648)
+- **Custom tool semantics for the stage router** — route-scoped exact-name
+  mappings classify custom tools as `observe`, `mutate`, or `plan` activity
+  (neutral `new` stays unchanged), decoupling tool semantics from any one
+  agent framework. (#606)
+- **Restricted LLM router for Rust hosts** — `build_llm_router(ServerState)`
+  exposes only the three inference endpoints (`/v1/chat/completions`,
+  `/v1/messages`, `/v1/responses`), so a host can own authentication, model
+  visibility, and operational routes on separate surfaces. (#586)
+- **`RoutingOutcome.selected_model_ids`** — the selected model and its
+  fallbacks merge into one ordered `Vec<ModelId>`, selected first, replacing
+  `selected_model_id` and `fallback_models`. (#592)
+- **Routing outcome metadata** — every successful outcome carries optional
+  `OutcomeMetadata { outcome_id, algorithm, evidence }`, and the outcome ID
+  is recorded on the matching `libsy.run` span. (#647)
+- **Bounded outcome evidence** — built-in algorithms populate
+  `RoutingOutcome.metadata.evidence` with bounded, structured JSON for the
+  facts that determined a route, without leaking prompts, responses, raw
+  errors, or arbitrary internal state. (#655)
+- **Outcome metadata in OpenTelemetry and Python** — the `libsy.run` span
+  records `outcome_id` and the ordered `selected_model_ids`, and Python's
+  `RoutingOutcome.metadata` exposes the same identity and evidence. (#658)
+- **Route attribution in the durable log** — durable routing-log records
+  gain `route_id` and `algorithm`, so per-route usage stays recoverable when
+  two configured routes serve the same backend model; older JSONL records
+  remain readable. (#618)
+- **Algorithms select a `Category`, not a specific model** — available
+  models travel with each request in the `Driver`, algorithms choose a
+  category such as `efficient`, and the category-to-model mapping lives in
+  the `Driver`. (#630)
+- **Request origin in routing logs** — the caller-supplied
+  `x-switchyard-origin` header is recorded as optional `origin` in the
+  durable routing JSONL for buffered answers, streamed answers, and judge
+  records; missing, empty, or non-text values serialize as `null`. (#641)
 
 ### Changed
 
+- **HTTP client errors stop routing** — after the configured retries, the Rust
+  runner stops the request instead of letting the routing algorithm choose a
+  fallback. This also applies when `timeout_ms` is unset or an advisor has
+  `fail_open = true`. The runner collects streams used during routing and preserves
+  provider events for replay. Invalid judge verdicts keep their existing fallback.
 - **`Algorithm::route` returns `Result<RoutingOutcome>`** — instead of the
   bare final `Result`, so callers observe the full routing outcome (see #458
   for the design). (#459)
@@ -83,6 +155,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **LiteLLM integration replaced by a routing plugin** — the client
   integration becomes a routing plugin, and its example moves out of
   `experimental`. (#532)
+- **`Response` gains a required `upstream_headers` field** *(source-breaking)*
+  — `switchyard_protocol::Response` carries the upstream HTTP headers, so Rust
+  callers that construct a `Response` with a struct literal must add
+  `upstream_headers: Default::default()`. Field access and every other use are
+  unaffected, and there is no wire or Python-surface change. (#571)
 
 ### Removed
 
@@ -99,6 +176,89 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Responses continuations stay with the provider that holds their state** — a
+  request with `previous_response_id` or `conversation` could reach another
+  provider and fail with `400 state_not_found`. When answer targets use different
+  `[llm_clients]` entries, Switchyard records which model served each stored
+  Responses ID and conversation ID. Known continuations return to that model
+  without running the algorithm or trying another provider. Each route keeps up
+  to 65,536 IDs per process without discarding older records. Recording another
+  model for an existing ID returns `response_state_conflict`; exceeding the cap
+  returns `response_state_limit_exceeded`. Buffered replies use HTTP 409 and 503,
+  respectively; streams emit an error and stop. These checks happen after the
+  provider has done work. Records are lost on restart. A separate classifier
+  client does not affect routes whose answer targets share one client.
+- **Cross-format tool results keep image and file content** — an Anthropic
+  `tool_result` carrying image or document blocks reached a Responses target
+  as text only, and an image-only result became an empty `output`. In the other
+  direction a Responses `function_call_output` whose `output` was an array of
+  `input_text`, `input_image`, and `input_file` parts reached an Anthropic
+  target as one JSON string. Both directions now carry typed text, image, and
+  file blocks; plain-text results are unchanged. OpenAI `file_data` encodes as
+  a valid Anthropic `document`: raw base64 with a `media_type`, the data-URI
+  prefix stripped, and the file name as `title`.
+- **Stored Responses tool continuations stay on the selected model** — a
+  `function_call_output` sent with `previous_response_id`, where the matching
+  `function_call` lives in provider state, was decoded as ordinary user text. A
+  route with `classify_trigger = "user_turn"` then judged the turn again and
+  could switch models mid tool loop, and a Responses upstream received a user
+  message instead of the tool output. The output now stays a tool result, and
+  a stored `custom_tool_call_output` keeps its type when re-encoded. An output
+  with no matching call and no `previous_response_id` still degrades to
+  readable user text.
+- **Return HTTP 502 for failed Responses generations** — a provider's HTTP 200
+  response with `status: "failed"` could appear as an empty successful answer.
+  Switchyard now counts the call as an error and tries another model when the
+  route supports fallback. If this failure reaches the application, Chat
+  Completions, Anthropic Messages, and Responses return HTTP 502. Error replies
+  preserve the provider's message and, for OpenAI applications, a nonempty
+  string error code. Switchyard removes echoed caller credentials.
+- **Chat tool-call index counts tool calls, not content blocks** — the OpenAI
+  Chat stream encoder copied the source index into `tool_calls[].index`.
+  Anthropic and Responses index the whole content array, so text ahead of the
+  first tool call pushed the sole call to index 1, and the official OpenAI SDK,
+  which subscripts its `tool_calls` array with that index, raised `IndexError`.
+  Tool calls are now numbered within the Chat `tool_calls` array in order of
+  first appearance.
+- **Advisor stall checkpoint re-arms after a refunded review** — a
+  stall-triggered consult that failed open or returned an unparseable verdict
+  refunded the review budget but left the conversation's stall latch set, so
+  every later eligible turn silently bypassed the advisor. The latch now clears
+  whenever the reserved review is refunded or the budget is already spent.
+- **Streamed Responses tool calls end with a tool-use stop reason** — the
+  Responses stream decoder reported every `response.completed` as a plain
+  completion, so a streamed `function_call` reached Anthropic clients as
+  `stop_reason: "end_turn"` and Chat clients as `finish_reason: "stop"`.
+  Stop-reason-driven tool loops, including the official Anthropic TypeScript
+  SDK tool runner, then returned the unfinished tool-use turn without running
+  the tool. The decoder now reports `tool_use` when the completed output holds
+  a `function_call` or `custom_tool_call`, or when it already decoded tool
+  deltas, matching the buffered decoder.
+- **Harnesses without sub-agent identity on sub-agent routes** — Claude Code
+  sends the child identity header (`x-claude-code-agent-id`) that sub-agent
+  routing needs only from version 2.1.139. Older builds send just the session
+  id, so their sub-agent requests silently routed through the parent route.
+  Header normalization now flags such builds on
+  `switchyard_protocol::Metadata` as `subagent_identity_unsupported`, a route
+  with a `subagents` table logs one warning when it sees one, and the sub-agent
+  routing guide states the version floor. The new public field means downstream
+  code that builds `Metadata` with a full struct literal must add it or use
+  `..Metadata::default()`.
+- **Encrypted-only reasoning items open no summary part** — the Responses
+  stream encoder opened a `reasoning_summary_part` for every reasoning item and
+  closed it only when text had streamed, so an encrypted-only item left a part
+  open with no `done`. The part now opens on the first text delta. (#671)
+- **Responses reasoning through transforming routes** — reasoning that a route
+  buffers or re-encodes now reaches the client in the standard `summary_text`
+  shape with `reasoning_summary_*` events, encrypted-only and done-only
+  reasoning items are decoded from every carrier a provider uses, and encrypted
+  payloads are re-emitted under the provider's item id so the client's replay
+  verifies upstream. Responses with several reasoning items keep all of them.
+  (#646)
+- **Unique, bounded Responses item ids** — synthesized output-item ids carry a
+  per-response discriminator so replayed history no longer repeats `rs_0` and
+  `fc_1` across turns, and upstream response ids longer than 40 characters are
+  digested to stay within OpenAI's 64-character item-id limit. (#646)
 - **Reasoning order in mixed stream chunks** — the OpenAI Chat stream decoder
   emits reasoning deltas before content deltas from the same chunk, so
   interleaved reasoning is no longer reordered. (#387)
@@ -153,6 +313,41 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `message_stop` (optional `[DONE]` stays compatible for OpenAI Chat and
   Responses), and a duplicate EOF error is no longer appended after a decoded
   in-band provider error. (#425)
+
+- **Responses reasoning replayed as input history** — encrypted reasoning
+  items survive decode/encode after exact replay is invalidated, re-emitting
+  input history with `summary`/`encrypted_content` and omitting non-empty
+  `content` arrays. (#645)
+- **Buffered Responses input hardened for Codex upstreams** — rebuilt
+  requests carry resolvable tool names for upstreams that need them, and
+  parallel tool calls pair each result with its call instead of serializing
+  as `call, call, result, result`. (#664)
+- **Upstream URLs dropped from transport errors** — transport and timeout
+  errors no longer echo the upstream request URL, whose query string can
+  carry the key; the raw fallback proxy applies the same protection. (#649)
+- **Upstream bodies redacted from the client-call span** — the
+  `libsy.client_call` span keeps the target and HTTP status but no longer
+  records the raw upstream response body. (#611)
+- **Reasoning dropped from task classifier history** —
+  `TaskInput::build_messages` removes reasoning blocks from the history
+  handed to an LLM task classifier and drops messages left empty. (#610)
+- **Escalation judge anchored to task framing; verdict reasons logged** —
+  every user message that precedes the first assistant reply is anchored as
+  task framing with a wider per-message budget, so a specification sent
+  after Codex's environment block stays visible to the judge; verdicts keep
+  their reason, logged under the escalation target. (#639)
+- **OpenAI tool strictness preserved for Anthropic** — encoding an
+  Anthropic Messages tool definition writes `strict` for both `true` and
+  `false` and omits it when unset, so a strict tool no longer silently
+  becomes a normal tool. (#600)
+- **Anthropic tool strictness preserved** — decoding Anthropic Messages
+  requests keeps top-level `tools[].strict`, so explicit strictness reaches
+  OpenAI Chat and Responses targets instead of being replaced with an
+  absent value. (#585)
+- **Flat Responses `input_file` payloads decoded** — `decode_file_source`
+  reads `file_data`/`filename` carried directly on the content block, not
+  only nested under `file`, so flat payloads no longer fall through to
+  `FileSource::Raw`. (#590)
 
 ## [0.2.0]
 

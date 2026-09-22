@@ -3,9 +3,11 @@
 
 //! Rust HTTP server for libsy algorithms.
 
+mod capabilities;
 pub mod config;
 mod metrics;
 mod observability;
+mod redaction;
 mod response;
 mod routing_log;
 mod shutdown;
@@ -33,11 +35,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use axum_server::tls_rustls::RustlsConfig;
-use libsy::{Algorithm, LibsyError, RoutingOutcome};
+use libsy::{LibsyError, RoutingOutcome};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use switchyard_llm_client::{AuxiliaryOperation, ClientRouter, RunObservation, RunObserver};
+use switchyard_llm_client::{AuxiliaryOperation, RunObservation, RunObserver};
 use switchyard_protocol::{LlmClientError, Metadata, ModelId, Request, Usage};
 use switchyard_runner::{
     CallerAuthKind, DecisionTarget, ModelCapabilities, Route, RunOutput, Runner, RunnerError,
@@ -63,7 +65,27 @@ pub const DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 const HEADER_SELECTED_MODEL: &str = "x-model-router-selected-model";
+const FORWARDED_UPSTREAM_HEADERS: &[&str] = &[
+    "baggage",
+    "openai-processing-ms",
+    // Anthropic spells its correlation id without the `x-` prefix.
+    "request-id",
+    "traceparent",
+    "tracestate",
+    "x-request-id",
+];
+const FORWARDED_UPSTREAM_HEADER_PREFIXES: &[&str] =
+    &["anthropic-ratelimit-", "x-ratelimit-", "x-upstream-"];
 const MAX_ROUTING_HEADER_VALUE_LEN: usize = 512;
+
+/// Whether an upstream header is safe and useful to expose downstream.
+fn should_forward_upstream_header(name: &HeaderName) -> bool {
+    let name = name.as_str();
+    FORWARDED_UPSTREAM_HEADERS.contains(&name)
+        || FORWARDED_UPSTREAM_HEADER_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+}
 /// Non-standard status used only in logs and metrics for a request whose
 /// downstream client disconnected before any response was written.
 const CLIENT_CLOSED_REQUEST: u16 = 499;
@@ -124,7 +146,6 @@ struct DecisionTargetResponse {
     model: ModelId,
     llm_client: DecisionLlmClientResponse,
     extra_body: BTreeMap<String, Value>,
-    extra_body_override: BTreeMap<String, Value>,
 }
 
 /// Non-secret client settings needed to call a selected model.
@@ -138,6 +159,7 @@ struct DecisionLlmClientResponse {
 #[derive(Clone)]
 pub struct ServerState {
     runner: Arc<Runner>,
+    redactor: Arc<redaction::Redactor>,
     fallback_http: reqwest::Client,
     metrics: prometheus::Registry,
     stats: StatsAccumulator,
@@ -180,29 +202,6 @@ impl SharedRoutingLog {
 }
 
 impl ServerState {
-    /// Creates server state from route model IDs, algorithms, and per-target clients.
-    pub fn new(routes: Vec<(ModelId, Arc<dyn Algorithm>, ClientRouter)>) -> ServerResult<Self> {
-        let routes = routes
-            .into_iter()
-            .map(|(model, algorithm, clients)| {
-                (
-                    model,
-                    Route::new(
-                        algorithm,
-                        clients,
-                        None,
-                        ModelCapabilities::default(),
-                        None,
-                        None,
-                        Vec::new(),
-                    ),
-                )
-            })
-            .collect();
-        let runner = Runner::new(routes);
-        Self::from_runner(runner)
-    }
-
     /// Creates HTTP-server state around an already configured runner.
     pub fn from_runner(runner: Runner) -> ServerResult<Self> {
         let metrics = metrics::registry().map_err(ServerError::new)?;
@@ -214,7 +213,9 @@ impl ServerState {
             metrics.clone(),
             runner.models().map(|model| model.algorithm),
         );
+        let redactor = redaction::Redactor::new(runner.provider_api_keys());
         Ok(Self {
+            redactor: Arc::new(redactor),
             runner: Arc::new(runner),
             fallback_http,
             metrics,
@@ -262,7 +263,6 @@ impl ServerState {
                 base_url: target.base_url,
             },
             extra_body: target.extra_body,
-            extra_body_override: target.extra_body_override,
         };
         Some(DecisionResponse {
             selected: convert(description.selected),
@@ -303,11 +303,6 @@ impl ServerRunOptions {
 
 /// Validates the runtime and starts the HTTP server unless `dry_run` is set.
 pub async fn run_server(state: ServerState, options: ServerRunOptions) -> ServerResult<()> {
-    // ⛔ Before anything binds: a configured-but-unreadable base-instructions file must stop
-    // the server, not degrade to the stub. Placed ahead of the dry-run return so `--dry-run`
-    // reports it too — the deploy gate runs dry-run, and it is the cheapest place to catch it.
-    validate_base_instructions()?;
-
     if options.dry_run {
         println!("{}", dry_run_summary(&state));
         return Ok(());
@@ -440,6 +435,7 @@ fn stats_observer(
     classifier_log: Option<(SharedRoutingLog, routing_log::RoutingLogContext)>,
 ) -> RunObserver {
     Arc::new(move |observation| match observation {
+        RunObservation::Outcome(_) => {}
         RunObservation::AnswerCall(call) => {
             let latency_ms = call.duration.as_secs_f64() * 1_000.0;
             if call.is_success {
@@ -528,6 +524,10 @@ fn primary_llm_routes() -> Router<ServerState> {
 fn finish_router(router: Router<ServerState>, state: ServerState) -> Router {
     router
         .layer(DefaultBodyLimit::max(DEFAULT_MAX_REQUEST_BODY_BYTES))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            redaction::redact_response,
+        ))
         // `layer` only wraps routes registered before it, so this stays last.
         .layer(axum::middleware::from_fn(stamp_request_start))
         .with_state(state)
@@ -617,7 +617,7 @@ async fn proxy_unmatched(State(state): State<ServerState>, request: HttpRequest)
         }
         Err(error) => error_response(
             StatusCode::BAD_GATEWAY,
-            error.to_string(),
+            error.without_url().to_string(),
             "upstream_error",
             "upstream_error",
         ),
@@ -732,6 +732,7 @@ async fn decision(
         .as_deref()
         .map(ModelId::from)
         .unwrap_or_default();
+
     let mut outcome = match route.decide(request).await {
         Ok(outcome) => outcome,
         Err(error) => return runner_error(error),
@@ -963,9 +964,14 @@ fn llm_json_body(
 fn resolve_route(
     state: &ServerState,
     metadata: Metadata,
-    body: Value,
+    mut body: Value,
     wire_format: WireFormat,
 ) -> std::result::Result<(&Route, Request), Response> {
+    // Only trusted translation hops may supply exact request preservation state.
+    // Strip it before decoding and retaining the raw body for upstream replay.
+    if let Some(metadata) = body.get_mut("metadata").and_then(Value::as_object_mut) {
+        metadata.remove(switchyard_translation::util::SWITCHYARD_METADATA_KEY);
+    }
     let llm_request = decode_request(wire_format, &body)
         .map_err(|error| invalid_body_error(StatusCode::BAD_REQUEST, error.to_string()))?;
     let requested_model = llm_request
@@ -1004,6 +1010,18 @@ fn resolve_route(
             "invalid_request_error",
         ));
     }
+    if let Some(capability) =
+        capabilities::unsupported_capability(route.capabilities(), &llm_request, &body)
+    {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "route {requested_model} declares {capability} = false; remove the unsupported input or select another route"
+            ),
+            "invalid_request_error",
+            "unsupported_capability",
+        ));
+    }
     let request = Request {
         llm_request,
         raw_request: Some(body),
@@ -1038,9 +1056,21 @@ async fn handle_llm_request(
         state.stats.clone(),
         state.routing_log.clone().zip(routing_log_context.clone()),
     );
+
     let output = match route.execute(request, Some(observer)).await {
         Ok(output) => output,
-        Err(error) => return runner_error(error),
+        Err(error) => {
+            if let RunnerError::Algorithm(LibsyError::ClientCall {
+                target,
+                source:
+                    LlmClientError::ResponseStateLimitExceeded { .. }
+                    | LlmClientError::ResponseStateConflict,
+            }) = &error
+            {
+                state.stats.record_response_error(target);
+            }
+            return runner_error(error);
+        }
     };
     let RunOutput {
         selected_model,
@@ -1049,7 +1079,7 @@ async fn handle_llm_request(
     // The response carries the candidate that actually served it. Fall back to the routing
     // selection for algorithms that return a response without an offloaded model call.
     let served_model = response.served_model().cloned().or(Some(selected_model));
-    let response = if let Some(served_model) = served_model.as_ref() {
+    let mut response = if let Some(served_model) = served_model.as_ref() {
         let cache_eligible = cache_probe
             .as_ref()
             .map(|probe| state.stats.prefix_eligibility(served_model, probe))
@@ -1066,12 +1096,27 @@ async fn handle_llm_request(
         response
     };
 
+    let upstream_headers = std::mem::take(&mut response.upstream_headers);
     let response_model = served_model.as_ref().map(ToString::to_string);
-    let mut response =
-        match into_http_response(response, wire_format, response_model, request_extensions) {
-            Ok(response) => response,
-            Err(error) => return server_error(error.to_string()),
-        };
+    let mut response = match into_http_response(
+        response,
+        wire_format,
+        response_model,
+        request_extensions,
+        Arc::clone(&state.redactor),
+    ) {
+        Ok(response) => response,
+        Err(error) => return server_error(error.to_string()),
+    };
+    // Forward upstream headers before Switchyard writes its own so any header
+    // this server emits always overrides an upstream echo of the same name.
+    let response_headers = response.headers_mut();
+    for (name, value) in upstream_headers.iter() {
+        if !should_forward_upstream_header(name) {
+            continue;
+        }
+        response_headers.append(name.clone(), value.clone());
+    }
     if let Some(served_model) = served_model.as_ref() {
         attach_routing_headers(&mut response, served_model.as_str());
     }
@@ -1230,6 +1275,18 @@ fn runner_error(error: RunnerError) -> Response {
 
 fn client_error(error: &LlmClientError) -> Response {
     match error {
+        LlmClientError::ResponseStateLimitExceeded { .. } => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error.to_string(),
+            "server_error",
+            "response_state_limit_exceeded",
+        ),
+        LlmClientError::ResponseStateConflict => error_response(
+            StatusCode::CONFLICT,
+            error.to_string(),
+            "server_error",
+            "response_state_conflict",
+        ),
         LlmClientError::InvalidRequest { message }
         | LlmClientError::RequestTranslation(message) => error_response(
             StatusCode::BAD_REQUEST,
@@ -1249,12 +1306,7 @@ fn client_error(error: &LlmClientError) -> Response {
             "invalid_request_error",
             "context_length_exceeded",
         ),
-        LlmClientError::UpstreamHttp { status, body } => error_response(
-            *status,
-            upstream_error_message(body),
-            "upstream_error",
-            "upstream_error",
-        ),
+        LlmClientError::UpstreamHttp { status, body } => upstream_error(*status, body),
         LlmClientError::Transport { source } | LlmClientError::InvalidResponse { source } => {
             error_response(
                 StatusCode::BAD_GATEWAY,
@@ -1280,26 +1332,25 @@ fn client_error(error: &LlmClientError) -> Response {
     }
 }
 
-// Provider errors are often JSON documents; expose their message without
-// embedding the entire document as an escaped string in our error envelope.
-fn upstream_error_message(body: &str) -> String {
-    serde_json::from_str::<Value>(body)
-        .ok()
-        .and_then(|body| {
-            body.pointer("/error/message")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| body.to_string())
+// Keep the provider's message and nonempty string code in our error JSON.
+fn upstream_error(status: StatusCode, body: &str) -> Response {
+    let parsed = serde_json::from_str::<Value>(body).unwrap_or_default();
+    let error = &parsed["error"];
+    let message = error["message"].as_str().unwrap_or(body);
+    let code = error["code"]
+        .as_str()
+        .filter(|code| !code.is_empty())
+        .unwrap_or("upstream_error");
+    error_response(status, message, "upstream_error", code)
 }
 
-// Error metadata retained until the client-facing endpoint selects an envelope.
+// Keep error details until the endpoint chooses its response format.
 #[derive(Clone)]
 struct ApiError {
     status: StatusCode,
     message: String,
     error_type: &'static str,
-    code: &'static str,
+    code: String,
 }
 
 impl ApiError {
@@ -1307,13 +1358,13 @@ impl ApiError {
         status: StatusCode,
         message: impl Into<String>,
         error_type: &'static str,
-        code: &'static str,
+        code: impl Into<String>,
     ) -> Self {
         Self {
             status,
             message: message.into(),
             error_type,
-            code,
+            code: code.into(),
         }
     }
 
@@ -1384,19 +1435,18 @@ fn error_response(
     status: StatusCode,
     message: impl Into<String>,
     error_type: &'static str,
-    code: &'static str,
+    code: impl Into<String>,
 ) -> Response {
     ApiError::new(status, message, error_type, code).into_response(WireFormat::OpenAiChat)
 }
 
 async fn models(State(state): State<ServerState>) -> Json<Value> {
-    Json(model_list_payload(state.runner.models().map(|model| {
-        (
-            model.id.as_str(),
-            model.capabilities,
-            model.base_instructions,
-        )
-    })))
+    Json(model_list_payload(
+        state
+            .runner
+            .models()
+            .map(|model| (model.id.as_str(), model.capabilities)),
+    ))
 }
 
 async fn get_stats(State(state): State<ServerState>) -> Json<StatsSnapshot> {
@@ -1477,26 +1527,18 @@ async fn not_found() -> Response {
 }
 
 fn model_list_payload<'a>(
-    entries: impl IntoIterator<Item = (&'a str, ModelCapabilities, Option<&'a str>)>,
+    entries: impl IntoIterator<Item = (&'a str, ModelCapabilities)>,
 ) -> Value {
     let mut entries = entries.into_iter().collect::<Vec<_>>();
-    entries.sort_unstable_by_key(|(model_id, _, _)| *model_id);
-    let model_ids = entries
-        .iter()
-        .map(|(model, _, _)| *model)
-        .collect::<Vec<_>>();
+    entries.sort_unstable_by_key(|(model_id, _)| *model_id);
+    let model_ids = entries.iter().map(|(model, _)| *model).collect::<Vec<_>>();
     let first_id = model_ids.first().copied();
     let last_id = model_ids.last().copied();
     json!({
         "object": "list",
-        "data": entries.iter().map(|(model, caps, _)| model_entry_json(model, *caps)).collect::<Vec<_>>(),
-        "models": entries
-            .iter()
-            .enumerate()
-            .map(|(priority, (model, caps, base))| {
-                codex_model_entry_json(model, *caps, priority, *base)
-            })
-            .collect::<Vec<_>>(),
+        "data": entries.iter().map(|(model, caps)| model_entry_json(model, *caps)).collect::<Vec<_>>(),
+        // Codex requires this key; an empty list preserves its own catalog and instructions.
+        "models": [],
         "first_id": first_id,
         "last_id": last_id,
         "has_more": false,
@@ -1525,195 +1567,6 @@ fn model_entry_json(model: &str, capabilities: ModelCapabilities) -> Value {
             ],
         },
     })
-}
-
-// Builds the metadata Codex requires when it discovers models from a direct provider.
-//
-// This mirrors Codex's `ModelInfo` card. The benchmark harness builds the same card in
-// `benchmark/codex_model_catalog_lib.py`; keep the two in sync when Codex changes
-// the shape. Every field below is either derived from the route's declared capabilities or a
-// required `ModelInfo` field the server has no better value for.
-//
-// Two kinds of fields live here. context_window, tool_calling, and reasoning are model
-// facts a backend can publish; the route declares them in config today. The rest
-// (shell_type, apply_patch_tool_type, base_instructions, the reasoning-level presets,
-// truncation_policy) are Codex client conventions no backend returns, so they stay
-// constant.
-//
-// TODO: source context_window, tool_calling, and reasoning from the backend, not route
-// config. Switchyard is a proxy, so it should re-publish what the backend advertises
-// when it can — OpenRouter's /api/v1/models exposes context_length and
-// supported_parameters — and fall back to the route's declared value. Some backends
-// publish nothing (the NVIDIA gateway returns id-only models and blocks /model/info),
-// so keep failing closed to config.
-// Codex ADOPTS whatever `base_instructions` the catalog advertises, so the stub below
-// replaces Codex's own system prompt on every routed session (upstream issue #565). That is
-// harmless for routing and fatal for measurement: a quality number taken through the proxy
-// describes an agent running a six-word prompt, not Codex.
-//
-// `SWITCHYARD_BASE_INSTRUCTIONS` makes it controllable without moving the default:
-//
-//   unset            -> the historical stub, so existing deployments do not change
-//   set to a string  -> that string is advertised verbatim
-//   set to EMPTY     -> the field is OMITTED from the card entirely, which is what lets
-//                       Codex fall back to its own bundled prompt
-//
-// The empty case REMOVES the key rather than sending `null` or `""`: the point is to say
-// nothing about base instructions, and a present-but-empty string is still a value to adopt.
-const BASE_INSTRUCTIONS_ENV: &str = "SWITCHYARD_BASE_INSTRUCTIONS";
-const BASE_INSTRUCTIONS_FILE_ENV: &str = "SWITCHYARD_BASE_INSTRUCTIONS_FILE";
-const BASE_INSTRUCTIONS_STUB: &str = "You are Codex, a coding agent.";
-
-// `..._FILE` exists because the value worth serving is a real system prompt — Codex's own
-// bundled prompt is ~21 KB of multi-line markdown — and systemd `Environment=` cannot carry
-// that. Resolution order, most specific first:
-//
-//   1. the route's own `base_instructions` in routes.toml
-//   2. SWITCHYARD_BASE_INSTRUCTIONS_FILE   (deployment-wide, contents of the file)
-//   3. SWITCHYARD_BASE_INSTRUCTIONS        (deployment-wide, inline)
-//   4. the built-in stub
-//
-// At every level an EMPTY value means "advertise nothing", which omits the key.
-// ⛔ Omitting is nearly always the wrong choice against a real Codex: its catalog decoder
-// rejects an entry carrying neither `base_instructions` nor
-// `model_messages.instructions_template`, and because the model list decodes as one Vec, a
-// single omitted entry discards the WHOLE catalog — Codex warns to stderr and falls back to
-// default metadata, silently losing `input_modalities` and dropping images client-side.
-// The option is kept because it is the only way to say nothing, not because it is safe.
-static BASE_INSTRUCTIONS_FILE_VALUE: std::sync::OnceLock<Option<String>> =
-    std::sync::OnceLock::new();
-
-/// Reads the file named by `SWITCHYARD_BASE_INSTRUCTIONS_FILE`, if it is set.
-///
-/// Trailing newlines are trimmed so a file and an equivalent inline value advertise the
-/// same string. Returns `Err` when the variable names a file that cannot be read: a
-/// configured-but-missing prompt must stop the server, never degrade to the stub.
-fn read_base_instructions_file() -> Result<Option<String>, String> {
-    let path = match std::env::var(BASE_INSTRUCTIONS_FILE_ENV) {
-        Ok(path) if !path.is_empty() => path,
-        _ => return Ok(None),
-    };
-    read_base_instructions_path(&path).map(Some)
-}
-
-/// Reads one base-instructions file. Split out from the env lookup so the failure path is
-/// testable without mutating process-global environment under a parallel test runner.
-fn read_base_instructions_path(path: &str) -> Result<String, String> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => Ok(text.trim_end_matches('\n').to_string()),
-        Err(error) => Err(format!(
-            "{BASE_INSTRUCTIONS_FILE_ENV} is set to {path}, which cannot be read: {error}"
-        )),
-    }
-}
-
-/// Resolves and caches the base-instructions file once, so request handling stays
-/// infallible. Call this at startup: it is where a bad path is reported.
-fn validate_base_instructions() -> ServerResult<()> {
-    let value = read_base_instructions_file().map_err(ServerError::new)?;
-    let _ = BASE_INSTRUCTIONS_FILE_VALUE.set(value);
-    Ok(())
-}
-
-/// The deployment-wide value, file first and inline second.
-fn deployment_base_instructions() -> Option<String> {
-    if let Some(Some(value)) = BASE_INSTRUCTIONS_FILE_VALUE.get() {
-        return Some(value.clone());
-    }
-    std::env::var(BASE_INSTRUCTIONS_ENV).ok()
-}
-
-/// What a route should advertise, once route and deployment settings are combined.
-enum BaseInstructions {
-    /// Say nothing: remove the key from the catalog entry.
-    Omit,
-    /// Advertise this string verbatim.
-    Value(String),
-}
-
-fn resolve_base_instructions(route: Option<&str>) -> BaseInstructions {
-    let chosen = route
-        .map(str::to_string)
-        .or_else(deployment_base_instructions);
-    match chosen {
-        Some(value) if value.is_empty() => BaseInstructions::Omit,
-        Some(value) => BaseInstructions::Value(value),
-        None => BaseInstructions::Value(BASE_INSTRUCTIONS_STUB.to_string()),
-    }
-}
-
-fn codex_model_entry_json(
-    model: &str,
-    capabilities: ModelCapabilities,
-    priority: usize,
-    route_base_instructions: Option<&str>,
-) -> Value {
-    let base_instructions = resolve_base_instructions(route_base_instructions);
-    // Codex is non-functional without shell and apply_patch, so an undeclared tool
-    // capability defaults to enabled here; the OpenAI `data` entry reports the raw
-    // Option separately for clients that want the undeclared state.
-    let tool_calling = capabilities.tool_calling.unwrap_or(true);
-    let reasoning = capabilities.reasoning.unwrap_or(false);
-    let mut entry = json!({
-        "slug": model,
-        "display_name": model,
-        "description": "Switchyard-routed model.",
-        "default_reasoning_level": if reasoning { json!("xhigh") } else { Value::Null },
-        "supported_reasoning_levels": if reasoning { reasoning_levels() } else { json!([]) },
-        "shell_type": if tool_calling { "shell_command" } else { "disabled" },
-        "visibility": "list",
-        "supported_in_api": true,
-        // Catalog list position (routes are listed in sorted id order), not a quality rank.
-        "priority": priority,
-        "additional_speed_tiers": [],
-        "availability_nux": null,
-        "upgrade": null,
-        // Required `ModelInfo` string. Unlike the launcher, the server cannot read
-        // Codex's bundled prompt, so it sends a minimal stub.
-        "base_instructions": match &base_instructions {
-            BaseInstructions::Value(value) => Value::String(value.clone()),
-            BaseInstructions::Omit => Value::Null,
-        },
-        "supports_reasoning_summaries": reasoning,
-        "default_reasoning_summary": "none",
-        "support_verbosity": reasoning,
-        "default_verbosity": if reasoning { json!("low") } else { Value::Null },
-        "apply_patch_tool_type": if tool_calling { Some("freeform") } else { None },
-        "web_search_tool_type": "text",
-        "truncation_policy": {"mode": "tokens", "limit": 10_000},
-        "supports_parallel_tool_calls": tool_calling,
-        "supports_image_detail_original": false,
-        "context_window": capabilities.context_window,
-        "max_context_window": capabilities.context_window,
-        "effective_context_window_percent": 95,
-        "experimental_supported_tools": [],
-        // Codex omits an attached image client-side when this says text-only, so a
-        // route whose target can see must declare `vision = true`. Fails closed.
-        "input_modalities": if capabilities.vision.unwrap_or(false) {
-            json!(["text", "image"])
-        } else {
-            json!(["text"])
-        },
-        "supports_search_tool": false,
-    });
-    // Omit rather than blank: see BASE_INSTRUCTIONS_ENV above.
-    if matches!(base_instructions, BaseInstructions::Omit)
-        && let Some(object) = entry.as_object_mut()
-    {
-        object.remove("base_instructions");
-    }
-    entry
-}
-
-// The reasoning-effort presets Codex offers for a reasoning-capable route. Kept in
-// step with the benchmark template in `codex_model_catalog_lib.py`.
-fn reasoning_levels() -> Value {
-    json!([
-        {"effort": "low", "description": "Fast responses with lighter reasoning"},
-        {"effort": "medium", "description": "Balances speed and reasoning depth"},
-        {"effort": "high", "description": "Greater reasoning depth"},
-        {"effort": "xhigh", "description": "Extra high reasoning depth"},
-    ])
 }
 
 fn startup_banner(options: &ServerRunOptions, state: &ServerState, color: bool) -> String {
@@ -1814,66 +1667,6 @@ fn endpoint_listing(has_routing_log: bool) -> String {
 
 #[cfg(test)]
 mod tests {
-
-    // A route's own `base_instructions` outrank any deployment-wide value. Asserted with an
-    // explicit route override, which short-circuits before the env is consulted, so this
-    // stays deterministic under a parallel runner.
-    #[test]
-    fn route_base_instructions_win_over_the_deployment_value() {
-        match resolve_base_instructions(Some("route-specific prompt")) {
-            BaseInstructions::Value(value) => assert_eq!(value, "route-specific prompt"),
-            BaseInstructions::Omit => panic!("a declared route value must be advertised"),
-        }
-    }
-
-    // An empty value at the winning level means "say nothing", which removes the key.
-    // ⛔ Against a real Codex this discards the WHOLE catalog, so the option exists to be
-    // possible, not to be safe. See the comment on BASE_INSTRUCTIONS_FILE_ENV.
-    #[test]
-    fn an_empty_route_value_omits_the_key_entirely() {
-        assert!(matches!(
-            resolve_base_instructions(Some("")),
-            BaseInstructions::Omit
-        ));
-        let entry = codex_model_entry_json("r", ModelCapabilities::default(), 0, Some(""));
-        let object = entry.as_object().expect("entry is an object");
-        assert!(
-            !object.contains_key("base_instructions"),
-            "an empty value must remove the key, not send an empty string"
-        );
-    }
-
-    // A declared route value reaches the served catalog entry verbatim.
-    #[test]
-    fn a_route_value_reaches_the_catalog_entry() {
-        let entry = codex_model_entry_json("r", ModelCapabilities::default(), 0, Some("hello"));
-        assert_eq!(entry["base_instructions"], serde_json::json!("hello"));
-    }
-
-    // ⛔ Fail closed: a configured file that cannot be read is an error, never a silent
-    // fallback to the stub. Silent degradation is the defect this whole option exists to
-    // avoid, so it gets its own test.
-    #[test]
-    fn an_unreadable_base_instructions_file_is_an_error() {
-        let error = read_base_instructions_path("/nonexistent/base-instructions.md")
-            .expect_err("a missing file must not resolve");
-        assert!(
-            error.contains("cannot be read"),
-            "error should name the failure, got: {error}"
-        );
-    }
-
-    // Trailing newlines are trimmed so a file and an equivalent inline value agree.
-    #[test]
-    fn a_base_instructions_file_is_read_without_its_trailing_newline() {
-        let dir = std::env::temp_dir().join("switchyard-base-instructions-test");
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let path = dir.join("prompt.md");
-        std::fs::write(&path, "line one\nline two\n").expect("write fixture");
-        let value = read_base_instructions_path(&path.to_string_lossy()).expect("readable");
-        assert_eq!(value, "line one\nline two");
-        let _ = std::fs::remove_file(&path);
-    }
     use switchyard_llm_client::LlmCallObservation;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{Notify, oneshot};

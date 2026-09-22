@@ -17,6 +17,7 @@ use crate::{ModelCapabilities, Route, RunnerError};
 pub struct Runner {
     routes: Vec<(ModelId, Route)>,
     fallback_base_url: Option<String>,
+    provider_api_keys: Vec<String>,
 }
 
 /// Borrowed model metadata returned while listing routes.
@@ -24,9 +25,6 @@ pub struct ModelInfo<'a> {
     pub id: &'a ModelId,
     pub algorithm: &'a str,
     pub capabilities: ModelCapabilities,
-    /// The route's own base instructions, when it declared any. Not a capability, so it
-    /// rides here rather than in `ModelCapabilities` (which stays `Copy`).
-    pub base_instructions: Option<&'a str>,
 }
 
 /// Fully resolved routing decision.
@@ -43,7 +41,6 @@ pub struct DecisionTarget {
     pub format: WireFormat,
     pub base_url: String,
     pub extra_body: BTreeMap<String, Value>,
-    pub extra_body_override: BTreeMap<String, Value>,
 }
 
 impl Runner {
@@ -65,7 +62,20 @@ impl Runner {
         Self {
             routes,
             fallback_base_url: None,
+            provider_api_keys: Vec::new(),
         }
+    }
+
+    /// Registers deployment-owned API keys for serving-surface output redaction.
+    /// TOML loading registers these automatically; programmatic hosts must supply them.
+    pub fn with_provider_api_keys(mut self, keys: Vec<String>) -> Self {
+        self.provider_api_keys = keys;
+        self
+    }
+
+    /// Returns deployment-owned secrets for serving-surface output redactors.
+    pub fn provider_api_keys(&self) -> &[String] {
+        &self.provider_api_keys
     }
 
     pub(crate) fn with_fallback_url(mut self, fallback_base_url: Option<String>) -> Self {
@@ -87,7 +97,6 @@ impl Runner {
             id,
             algorithm: route.algorithm_name(),
             capabilities: route.capabilities(),
-            base_instructions: route.base_instructions(),
         })
     }
 
@@ -103,7 +112,24 @@ impl Runner {
         outcome: &RoutingOutcome,
     ) -> Option<DecisionDescription> {
         let route = self.route(model.as_str())?;
-        let resolve = |selected: &ModelId| route.decision_target(selected);
+        let resolve = |selected: &ModelId| {
+            let mut target = route.decision_target(selected)?;
+            let mut url = reqwest::Url::parse(&target.base_url).ok()?;
+            let query: Vec<_> = url
+                .query_pairs()
+                .filter(|(name, _)| !matches!(name.as_ref(), "key" | "api_key"))
+                .map(|(name, value)| (name.into_owned(), value.into_owned()))
+                .collect();
+            if query.len() != url.query_pairs().count() {
+                url.set_query(None);
+                if !query.is_empty() {
+                    url.query_pairs_mut().extend_pairs(query);
+                }
+                // Only the returned metadata changes; inference still needs its credentials.
+                target.base_url = url.into();
+            }
+            Some(target)
+        };
         let mut model_ids = outcome.selected_model_ids.iter();
         Some(DecisionDescription {
             selected: resolve(model_ids.next()?)?,
