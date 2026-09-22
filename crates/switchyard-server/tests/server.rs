@@ -3670,3 +3670,152 @@ target = "shared"
     assert_eq!(capabilities["blind"]["vision"], json!(null));
     Ok(())
 }
+
+/// The config the two `responses_tool_images` tests share, differing only in the policy.
+fn tool_image_config(base_url: &str, policy: &str) -> String {
+    format!(
+        r#"
+schema_version = 1
+
+[llm_clients.mock]
+format = "openai_responses"
+base_url = "{base_url}"
+max_retries = 0
+{policy}
+
+[targets.only]
+id = "upstream-model"
+llm_client = "mock"
+
+[routes.route]
+id = "tool-image-route"
+type = "passthrough"
+target = "only"
+"#
+    )
+}
+
+/// A Responses request whose tool answered with a picture.
+fn tool_image_request() -> Value {
+    json!({
+        "model": "tool-image-route",
+        "input": [
+            {"type": "function_call_output", "call_id": "c1", "output": [
+                {"type": "input_image", "image_url": "data:image/png;base64,AAA"}
+            ]}
+        ]
+    })
+}
+
+/// The body the upstream actually received, which is the only thing that proves a
+/// config key reached the wire.
+async fn first_upstream_call(upstream: &MockUpstream) -> Value {
+    upstream
+        .calls
+        .lock()
+        .await
+        .first()
+        .cloned()
+        .expect("the upstream must have been called")
+}
+
+/// ⛔ **The deployed carry, end to end.** `responses_tool_images = "rehome"` exists because
+/// llama.cpp answers `400 "Output of tool call should be 'Input text'"` for an image inside a
+/// `function_call_output`. The unit tests pin the rewrite; this pins that the TOML key still
+/// REACHES it — the half that a config-loader refactor can silently drop without failing to
+/// compile.
+#[tokio::test]
+async fn responses_tool_images_rehome_reaches_the_upstream_wire() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let config = tool_image_config(&upstream.base_url, r#"responses_tool_images = "rehome""#);
+    let app = build_switchyard_router(load_test_config(&config)?);
+
+    send(&app, "POST", "/v1/responses", Some(tool_image_request())).await?;
+
+    let sent = first_upstream_call(&upstream).await;
+    let input = sent["input"].as_array().expect("input is an array");
+    assert_eq!(input.len(), 2, "the image should have been re-homed: {sent:#?}");
+    assert_eq!(input[0]["type"], "function_call_output");
+    assert_ne!(
+        input[0]["output"][0]["type"], "input_image",
+        "no image may remain inside the tool result — that is the 400"
+    );
+    assert_eq!(input[1]["role"], "user");
+    assert_eq!(input[1]["content"][0]["type"], "input_image");
+    Ok(())
+}
+
+/// ...and the control, without which the test above proves only that a request was sent.
+/// An unset key must leave the caller's placement alone, because every hosted Responses
+/// provider accepts it and rewriting there would be a deviation nobody asked for.
+#[tokio::test]
+async fn a_client_without_the_key_leaves_the_tool_image_where_the_caller_put_it() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let config = tool_image_config(&upstream.base_url, "");
+    let app = build_switchyard_router(load_test_config(&config)?);
+
+    send(&app, "POST", "/v1/responses", Some(tool_image_request())).await?;
+
+    let sent = first_upstream_call(&upstream).await;
+    let input = sent["input"].as_array().expect("input is an array");
+    assert_eq!(input.len(), 1, "nothing may be added by default: {sent:#?}");
+    assert_eq!(input[0]["output"][0]["type"], "input_image");
+    Ok(())
+}
+
+/// ⛔ **`extra_body_override` is a per-target setting the CALLER cannot discard**, which is
+/// the whole reason it exists — so the test that matters is what the upstream received, not
+/// what the config parsed. ⚠ The request below sets `reasoning.effort` itself; the override
+/// must win, and the caller's sibling keys must survive.
+#[tokio::test]
+async fn extra_body_override_wins_over_the_caller_on_the_upstream_wire() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let config = format!(
+        r#"
+schema_version = 1
+
+[llm_clients.mock]
+format = "openai_responses"
+base_url = "{base_url}"
+max_retries = 0
+
+[targets.only]
+id = "upstream-model"
+llm_client = "mock"
+extra_body_override = {{ reasoning = {{ effort = "xhigh" }} }}
+
+[routes.route]
+id = "override-route"
+type = "passthrough"
+target = "only"
+"#,
+        base_url = upstream.base_url
+    );
+    let app = build_switchyard_router(load_test_config(&config)?);
+
+    send(
+        &app,
+        "POST",
+        "/v1/responses",
+        Some(json!({
+            "model": "override-route",
+            "input": [{"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "hi"}
+            ]}],
+            "reasoning": {"effort": "low"},
+            "temperature": 0.5
+        })),
+    )
+    .await?;
+
+    let sent = first_upstream_call(&upstream).await;
+    assert_eq!(
+        sent["reasoning"]["effort"], "xhigh",
+        "the target's override must beat the caller: {sent:#?}"
+    );
+    assert_eq!(
+        sent["temperature"], 0.5,
+        "an override must not discard the caller's other keys: {sent:#?}"
+    );
+    Ok(())
+}
