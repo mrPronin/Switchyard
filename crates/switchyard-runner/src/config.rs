@@ -325,9 +325,7 @@ impl DeploymentConfig {
                     None,
                 )
                 .with_responses_reasoning(client_config.responses_reasoning.unwrap_or_default())
-                .with_responses_tool_images(
-                    client_config.responses_tool_images.unwrap_or_default(),
-                )
+                .with_responses_tool_images(client_config.responses_tool_images.unwrap_or_default())
                 .with_responses_custom_tools(
                     client_config.responses_custom_tools.unwrap_or_default(),
                 ),

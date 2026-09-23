@@ -5307,7 +5307,11 @@ async fn responses_tool_images_rehome_reaches_the_upstream_wire() -> TestResult 
 
     let sent = first_upstream_call(&upstream).await;
     let input = sent["input"].as_array().expect("input is an array");
-    assert_eq!(input.len(), 2, "the image should have been re-homed: {sent:#?}");
+    assert_eq!(
+        input.len(),
+        2,
+        "the image should have been re-homed: {sent:#?}"
+    );
     assert_eq!(input[0]["type"], "function_call_output");
     assert_ne!(
         input[0]["output"][0]["type"], "input_image",

@@ -1198,19 +1198,6 @@ fn merge_extra_body(body: &mut Value, extra_body: &BTreeMap<String, Value>) {
     }
 }
 
-fn override_object(target: &mut Map<String, Value>, source: &Map<String, Value>) {
-    for (key, value) in source {
-        match (target.get_mut(key), value) {
-            (Some(Value::Object(nested_target)), Value::Object(nested_source)) => {
-                override_object(nested_target, nested_source);
-            }
-            _ => {
-                target.insert(key.clone(), value.clone());
-            }
-        }
-    }
-}
-
 // Anthropic and Bedrock both cap a request at four blocks carrying
 // `cache_control`, counting tools, system blocks and message blocks together.
 const MAX_CACHE_CONTROL_BLOCKS: usize = 4;

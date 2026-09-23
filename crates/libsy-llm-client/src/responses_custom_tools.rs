@@ -80,7 +80,10 @@ fn translate_item(item: &mut Value) {
         Some("custom_tool_call") => {
             let raw = object.remove(ARGUMENT_FIELD);
             object.insert("type".to_string(), Value::from("function_call"));
-            object.insert("arguments".to_string(), Value::from(freeform_arguments(raw)));
+            object.insert(
+                "arguments".to_string(),
+                Value::from(freeform_arguments(raw)),
+            );
         }
         Some("custom_tool_call_output") => {
             object.insert("type".to_string(), Value::from("function_call_output"));
@@ -140,7 +143,10 @@ mod tests {
         assert_eq!(call["type"], "function_call");
         assert_eq!(call["name"], "apply_patch");
         assert_eq!(call["call_id"], "call_1");
-        assert!(call.get("input").is_none(), "raw input must not survive alongside arguments");
+        assert!(
+            call.get("input").is_none(),
+            "raw input must not survive alongside arguments"
+        );
 
         let arguments: Value = serde_json::from_str(call["arguments"].as_str().expect("a string"))
             .expect("arguments must be a JSON string");
@@ -169,7 +175,10 @@ mod tests {
         let mut body = hosted_apply_patch();
         let before = body.clone();
         ResponsesCustomToolPolicy::default().normalize(&mut body);
-        assert_eq!(ResponsesCustomToolPolicy::default(), ResponsesCustomToolPolicy::Preserve);
+        assert_eq!(
+            ResponsesCustomToolPolicy::default(),
+            ResponsesCustomToolPolicy::Preserve
+        );
         assert_eq!(body, before);
     }
 
