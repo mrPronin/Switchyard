@@ -1003,6 +1003,7 @@ fn decode_responses_tools(
                 .get("name")
                 .and_then(Value::as_str)
                 .filter(|name| !name.is_empty());
+            let description = tool.get("description").and_then(Value::as_str);
             for mut child in decode_responses_tools(tool.get("tools"), namespaces, custom_tools) {
                 // A nested container already qualified its own children, and the
                 // innermost name is the one that identifies the tool.
@@ -1013,7 +1014,10 @@ fn decode_responses_tools(
                     let qualified =
                         crate::codex_namespaces::qualified_tool_name(container, &child.name);
                     crate::codex_namespaces::record_tool_namespace(
-                        namespaces, &qualified, container,
+                        namespaces,
+                        &qualified,
+                        container,
+                        description,
                     );
                     child.name = qualified;
                 }
@@ -1460,7 +1464,7 @@ fn encode_responses_special_input(
                 .and_then(|namespaces| {
                     crate::codex_namespaces::split_qualified_name(namespaces, &call.name)
                 })
-                .map_or((call.name.clone(), None), |(name, namespace)| {
+                .map_or((call.name.as_str(), None), |(name, namespace)| {
                     (name, Some(namespace))
                 });
             let mut item = json!({
@@ -1470,7 +1474,7 @@ fn encode_responses_special_input(
                 "arguments": json_string(&call.arguments),
             });
             if let Some(namespace) = namespace {
-                item["namespace"] = Value::String(namespace);
+                item["namespace"] = Value::String(namespace.to_string());
             }
             Some(item)
         }
@@ -1493,8 +1497,8 @@ fn encode_responses_special_input(
                     .and_then(|namespaces| {
                         crate::codex_namespaces::split_qualified_name(namespaces, name)
                     })
-                    .map_or_else(|| (*name).to_string(), |(name, _)| name);
-                item["name"] = Value::String(name);
+                    .map_or(*name, |(name, _)| name);
+                item["name"] = Value::String(name.to_string());
             }
             Some(item)
         }
@@ -1694,21 +1698,27 @@ fn encode_responses_tools(
         match split {
             None => out.push(item),
             Some((name, namespace)) => {
-                item["name"] = Value::String(name);
+                item["name"] = Value::String(name.to_string());
                 match containers
                     .iter_mut()
                     .find(|(existing, _)| *existing == namespace)
                 {
                     Some((_, children)) => children.push(item),
-                    None => containers.push((namespace, vec![item])),
+                    None => containers.push((namespace.to_string(), vec![item])),
                 }
             }
         }
     }
     for (namespace, children) in containers {
+        let description = namespaces
+            .and_then(|namespaces| {
+                crate::codex_namespaces::namespace_description(namespaces, &namespace)
+            })
+            .unwrap_or_default();
         out.push(json!({
             "type": "namespace",
             "name": namespace,
+            "description": description,
             "tools": children,
         }));
     }
