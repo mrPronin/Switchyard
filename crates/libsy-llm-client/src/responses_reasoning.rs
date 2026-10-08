@@ -51,6 +51,19 @@ impl ResponsesReasoningPolicy {
             object.insert("type".to_string(), Value::from("message"));
         }
 
+        // ⛔ A hosted provider's server-side web search is replayed as a `web_search_call`
+        // item, which llama.cpp also rejects as "Cannot determine type of 'item'" —
+        // measured 2026-10-08: a mini-team session whose planner had searched the web
+        // 400'd on every later turn, in the box judge, before any target was chosen.
+        // The search's findings live in the assistant message that follows it; the item
+        // only records that a search ran. A local upstream cannot run or read it, so
+        // `Drop` (the policy every local client sets) removes it like reasoning.
+        if self == Self::Drop
+            && object.get("type").and_then(Value::as_str) == Some("web_search_call")
+        {
+            return false;
+        }
+
         if object.get("type").and_then(Value::as_str) != Some("reasoning") {
             return true;
         }
@@ -140,6 +153,29 @@ mod tests {
         });
         ResponsesReasoningPolicy::Drop.normalize(&mut body);
         assert_eq!(body["input"][0]["type"], "function_call");
+    }
+
+    #[test]
+    fn drop_removes_a_hosted_web_search_and_keeps_the_answer() {
+        let search = json!({
+            "type": "web_search_call",
+            "id": "ws_1",
+            "status": "completed",
+            "action": {"type": "search", "query": "codex skills"}
+        });
+        let answer = json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "A skill is a folder."}]
+        });
+        let mut body = json!({"input": [search.clone(), answer.clone()]});
+        ResponsesReasoningPolicy::Drop.normalize(&mut body);
+        assert_eq!(body["input"], json!([answer]));
+
+        // A hosted upstream ran the search itself, so it gets the item back unchanged.
+        let mut body = json!({"input": [search.clone()]});
+        ResponsesReasoningPolicy::PreserveEncrypted.normalize(&mut body);
+        assert_eq!(body["input"], json!([search]));
     }
 
     #[test]
