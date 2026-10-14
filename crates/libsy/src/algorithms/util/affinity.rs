@@ -49,7 +49,7 @@ pub enum ClassifyTrigger {
 
 /// Anthropic carries tool results as a `Role::User` message, so role alone cannot tell a
 /// human turn from a tool continuation.
-fn is_user_turn(message: &Message) -> bool {
+pub(crate) fn is_user_turn(message: &Message) -> bool {
     message.role == Role::User
         && !message
             .content

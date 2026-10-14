@@ -1107,6 +1107,81 @@ target = "strong"
         Ok(())
     }
 
+    /// A custom-mode route whose judge is unreachable, so only a directive can pick a
+    /// non-default target without failing over.
+    fn with_directive_route(extra: &str) -> String {
+        format!(
+            r#"{VALID_CONFIG}
+[routes.team]
+id = "switchyard/team"
+type = "llm_classifier"
+mode = "custom"
+models = {{ judge = ["classifier"], workhorse = ["strong"], efficient = ["weak"], any = ["weak", "strong"] }}
+default_target = "efficient"
+prompt = "Pick a group."
+response_schema = '{{"type":"object","properties":{{"route":{{"type":"string"}}}},"required":["route"]}}'
+policy = {{ type = "target_selector", selector = "/route" }}
+classify_trigger = "user_turn"
+{extra}
+"#
+        )
+    }
+
+    #[tokio::test]
+    async fn a_directive_routes_the_named_group_without_the_judge() -> RunnerResult<()> {
+        use switchyard_protocol::{Message, Request, Role};
+
+        let config = with_directive_route(
+            "[routes.team.directives]\nworkhorse = '(?i)\\b(use|let)\\s+(the\\s+)?workhorse\\b'",
+        );
+        let runner = Runner::from_toml(&config)?;
+        let route = runner.route("switchyard/team").unwrap();
+        let mut request = Request::default();
+        request
+            .llm_request
+            .messages
+            .push(Message::text(Role::User, "let workhorse solve this issue"));
+        let outcome = route.decide(request).await?;
+        // The judge client points at example.test; reaching `strong` proves it was skipped.
+        assert_eq!(outcome.selected_model_ids[0], ModelId::from("strong/model"));
+        Ok(())
+    }
+
+    #[test]
+    fn directives_are_validated() {
+        for (extra, expected) in [
+            (
+                "[routes.team.directives]\nplanner = 'use planner'",
+                "directives.planner names no group in models",
+            ),
+            (
+                "[routes.team.directives]\njudge = 'use judge'",
+                "must name a routing group",
+            ),
+            (
+                "[routes.team.directives]\nworkhorse = '(unclosed'",
+                "not a valid regex",
+            ),
+            ("[routes.team.directives]\nworkhorse = ''", "empty pattern"),
+        ] {
+            let error = error_message(&with_directive_route(extra));
+            assert!(error.contains(expected), "{expected}: {error}");
+        }
+        let subagent = with_subagent_llm_classifier(
+            VALID_CONFIG,
+            "passthrough",
+            "\ndirectives = { capable = 'use strong' }",
+        );
+        let error = error_message(&subagent);
+        assert!(error.contains("cannot use directives"), "{error}");
+        let capability = VALID_CONFIG.replace(
+            "base_threshold = 0.5",
+            "base_threshold = 0.5\ndirectives = { capable = 'use strong' }",
+        );
+        let error = error_message(&capability);
+        assert!(error.contains("directives requires custom mode"), "{error}");
+    }
+
     fn error_message(toml: &str) -> String {
         match runner_from_toml(toml) {
             Ok(_) => "configuration unexpectedly succeeded".to_string(),

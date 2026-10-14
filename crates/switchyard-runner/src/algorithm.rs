@@ -181,6 +181,7 @@ struct CustomClassifierRouteConfig {
     message_hash_fallback: bool,
     recent_turn_window: Option<usize>,
     max_output_tokens: u64,
+    directives: Vec<(Category, String)>,
 }
 
 /// Runtime model groups for a custom classifier, keyed by group name.
@@ -331,6 +332,11 @@ pub struct LlmClassifierRouteConfig {
     pub response_schema: Option<String>,
     /// Custom mode: how to read the chosen target out of the verdict.
     pub policy: Option<ClassifierPolicyConfig>,
+    /// Custom mode: group name to regex, matched against the latest user message
+    /// before the judge runs. A match routes the turn to that group with no judge
+    /// call ("let workhorse solve this"); no match leaves the judge to decide.
+    /// Tried in group-name order; the first match wins.
+    pub directives: Option<BTreeMap<String, String>>,
 }
 
 /// Routing policy applied only to delegated sub-agent work, nested inside a
@@ -1028,6 +1034,7 @@ impl LlmClassifierRouteConfig {
             default_target,
             response_schema,
             policy,
+            directives,
         } = self;
 
         let selected_mode = match (mode, escalation.is_some()) {
@@ -1035,6 +1042,12 @@ impl LlmClassifierRouteConfig {
             (None, true) => ClassifierMode::Escalation,
             (None, false) => ClassifierMode::Capability,
         };
+
+        if directives.is_some() && !matches!(selected_mode, ClassifierMode::Custom) {
+            return Err(AlgorithmConfigError::new(format!(
+                "llm_classifier route {route_name}: directives requires custom mode"
+            )));
+        }
 
         if decision.is_some() && !matches!(selected_mode, ClassifierMode::Capability) {
             return Err(AlgorithmConfigError::new(format!(
@@ -1186,6 +1199,7 @@ impl LlmClassifierRouteConfig {
                     )));
                 }
                 models.validate(route_name, &default_target)?;
+                let directives = validated_directives(route_name, directives, &models)?;
                 Ok(LlmClassifierModeConfig::Custom(
                     CustomClassifierRouteConfig {
                         models,
@@ -1201,11 +1215,50 @@ impl LlmClassifierRouteConfig {
                         message_hash_fallback: *message_hash_fallback,
                         recent_turn_window: *recent_turn_window,
                         max_output_tokens: *max_output_tokens,
+                        directives,
                     },
                 ))
             }
         }
     }
+}
+
+/// Checks each directive names a routable group of this route; the regex itself is
+/// compiled (and rejected if invalid) when the classifier is built.
+fn validated_directives(
+    route_name: &str,
+    directives: &Option<BTreeMap<String, String>>,
+    models: &CategoryModelConfig,
+) -> AlgorithmResult<Vec<(Category, String)>> {
+    let Some(directives) = directives else {
+        return Ok(Vec::new());
+    };
+    directives
+        .iter()
+        .map(|(group, pattern)| {
+            let category: Category = group.parse().map_err(|error| {
+                AlgorithmConfigError::new(format!(
+                    "llm_classifier route {route_name} directives.{group}: {error}"
+                ))
+            })?;
+            if category == Category::Judge || category == Category::Any {
+                return Err(AlgorithmConfigError::new(format!(
+                    "llm_classifier route {route_name} directives.{group}: must name a routing group, not {group}"
+                )));
+            }
+            if models.get(&category).is_empty() {
+                return Err(AlgorithmConfigError::new(format!(
+                    "llm_classifier route {route_name} directives.{group} names no group in models"
+                )));
+            }
+            if pattern.is_empty() {
+                return Err(AlgorithmConfigError::new(format!(
+                    "llm_classifier route {route_name} directives.{group} has an empty pattern"
+                )));
+            }
+            Ok((category, pattern.clone()))
+        })
+        .collect()
 }
 
 fn reject_custom_fields(
@@ -1261,6 +1314,11 @@ fn build_subagent_router_config(
                     "route {route_name}: subagents llm_classifier only supports mode custom"
                 )));
             };
+            if !config.directives.is_empty() {
+                return Err(AlgorithmConfigError::new(format!(
+                    "route {route_name}: subagents llm_classifier cannot use directives"
+                )));
+            }
             for name in config.models.all_names() {
                 resolve_target_model_id(route_name, name, targets)?;
             }
@@ -1433,6 +1491,7 @@ fn build_algorithm(
                     classifier_config.message_hash_fallback = config.message_hash_fallback;
                     classifier_config.recent_turn_window = config.recent_turn_window;
                     classifier_config.max_output_tokens = config.max_output_tokens;
+                    classifier_config.directives = config.directives;
                     LlmTaskClassifier::new(LlmClassifierConfig::Custom {
                         default_target: config.default_target,
                         config: classifier_config,

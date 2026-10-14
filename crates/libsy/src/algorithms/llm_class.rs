@@ -22,6 +22,7 @@ use super::util::affinity::{AffinityRouter, ClassifyTrigger};
 use super::util::classifier_contract::{
     ClassifierContract, ClassifierContractConfig, ClassifierResponseFormat,
 };
+use super::util::directive::DirectiveClassifier;
 use super::util::escalation::EscalationJudgeConfig;
 use super::util::llm_judge::{
     ClassifierInput, JsonSchemaDecoder, JudgeClassifier, JudgePolicy, JudgeRuntimeConfig,
@@ -523,6 +524,9 @@ pub struct CustomClassifierConfig {
     pub recent_turn_window: Option<usize>,
     /// Maximum completion tokens available to the classifier verdict.
     pub max_output_tokens: u64,
+    /// `(group, regex)` pairs tried against the latest user message before the judge.
+    /// The first match routes the turn to that group with no judge call.
+    pub directives: Vec<(Category, String)>,
 }
 
 impl CustomClassifierConfig {
@@ -540,6 +544,7 @@ impl CustomClassifierConfig {
             message_hash_fallback: false,
             recent_turn_window: None,
             max_output_tokens: DEFAULT_JUDGE_MAX_OUTPUT_TOKENS,
+            directives: Vec::new(),
         }
     }
 
@@ -608,6 +613,8 @@ struct ClassifierRouteConfig {
     default_target: Category,
     classify_trigger: ClassifyTrigger,
     message_hash_fallback: bool,
+    /// Tried after affinity and before the judge; a match skips the judge.
+    directive: Option<Arc<dyn Classifier<State>>>,
 }
 
 /// Terminal classifier for a cascade whose classifiers may all abstain.
@@ -715,6 +722,7 @@ impl LlmTaskClassifier {
                 default_target: Category::Capable,
                 classify_trigger,
                 message_hash_fallback,
+                directive: None,
             },
         )
     }
@@ -729,7 +737,13 @@ impl LlmTaskClassifier {
             message_hash_fallback,
             recent_turn_window,
             max_output_tokens,
+            directives,
         } = config;
+        let directive: Option<Arc<dyn Classifier<State>>> = if directives.is_empty() {
+            None
+        } else {
+            Some(Arc::new(DirectiveClassifier::new(&directives)?))
+        };
         let contract = ClassifierContract::from_inner_schema(&prompt, response_schema)?;
         let policy = match policy {
             CustomClassifierPolicy::TargetSelector { selector } => {
@@ -752,6 +766,7 @@ impl LlmTaskClassifier {
                 default_target,
                 classify_trigger,
                 message_hash_fallback,
+                directive,
             },
         )
     }
@@ -798,6 +813,11 @@ impl LlmTaskClassifier {
             route = route
                 .with_processor(affinity.clone())
                 .with_classifier(affinity.clone());
+        }
+        // After affinity, so a turn's retained target still holds across its tool calls;
+        // before the judge, so an explicit instruction is never second-guessed.
+        if let Some(directive) = config.directive {
+            route = route.with_classifier(directive);
         }
         let fallback = DefaultCategoryClassifier(config.default_target);
         Ok(Self {
