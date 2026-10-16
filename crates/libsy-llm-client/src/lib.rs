@@ -26,6 +26,7 @@ pub mod error;
 pub mod metrics;
 mod observability;
 mod observation;
+mod observed_translation;
 pub mod raw;
 mod responses_custom_tools;
 mod responses_reasoning;
