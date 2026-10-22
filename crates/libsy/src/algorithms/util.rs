@@ -15,6 +15,7 @@ pub(crate) mod target_selector;
 #[cfg(test)]
 pub(crate) mod tier_fixtures;
 pub(crate) mod tool_signals;
+pub(crate) mod transcript;
 
 use switchyard_protocol::ModelId;
 

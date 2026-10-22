@@ -22,7 +22,7 @@ use super::llm_class::{LlmClassifierConfig, LlmTaskClassifier, TaskClassifierCon
 use super::util::prompts::prepend_system_prompt;
 use super::util::stage::{
     DecisionSource, HandoffNoteConfig, PickerMode, StageClassifier, Tier, fall_open_tier,
-    record_decision_source, record_routing_decision,
+    record_routing_decision,
 };
 use super::util::tool_signals::{DEFAULT_RECENT_WINDOW, ToolSemantics, ToolSignalProcessor};
 use crate::core::algorithm::{Algorithm, Driver};
@@ -41,7 +41,7 @@ struct TierPromptProcessor {
 }
 
 #[async_trait]
-impl Processor<State> for TierPromptProcessor {
+impl Processor for TierPromptProcessor {
     async fn process(&self, _state: &mut State, event: Event<'_>) -> Result<()> {
         if let Event::Decision {
             request, category, ..
@@ -65,12 +65,12 @@ impl Processor<State> for TierPromptProcessor {
 /// The classifiers themselves are composition-agnostic and write no state; only
 /// this router knows where each sits in its cascade.
 struct SourceStamp {
-    inner: Arc<dyn Classifier<State>>,
+    inner: Arc<dyn Classifier>,
     source: DecisionSource,
 }
 
 #[async_trait]
-impl Classifier<State> for SourceStamp {
+impl Classifier for SourceStamp {
     async fn score(
         &self,
         state: &mut State,
@@ -80,7 +80,6 @@ impl Classifier<State> for SourceStamp {
         let (classification, served) = self.inner.score(state, request, driver).await?;
         // An abstaining classifier passes the turn on, so it is not its to claim.
         if let Some(winner) = classification.argmax(false)? {
-            record_decision_source(state, self.source);
             record_routing_decision(self.source, &winner.target);
             driver.set_evidence_if_empty(serde_json::json!({
                 "source": self.source.as_str(),
@@ -96,7 +95,7 @@ struct FallOpen {
 }
 
 #[async_trait]
-impl Classifier<State> for FallOpen {
+impl Classifier for FallOpen {
     async fn score(
         &self,
         state: &mut State,
@@ -122,10 +121,11 @@ impl Classifier<State> for FallOpen {
 
 /// The capability judge a stage router falls through to.
 pub struct LlmFallback {
-    /// Judge configuration. `recent_turn_window` is worth setting to this router's
-    /// `recent_window` so the judge reads the same span the signal scorer scored.
-    /// Note: `classify_trigger = new_session` and `message_hash_fallback` have no effect here —
-    /// the judge runs as a cascade classifier, not a standalone algorithm.
+    /// Judge configuration. Its `recent_turn_window` counts trailing messages, while
+    /// this router's `recent_window` counts tool results.
+    /// Note: `classify_trigger` and `message_hash_fallback` have no effect here. The judge
+    /// runs as a cascade classifier on every ambiguous turn, not as a standalone algorithm,
+    /// so no verdict is retained.
     pub config: TaskClassifierConfig,
 }
 
@@ -180,7 +180,7 @@ impl StageRouterConfig {
 /// decide first, an optional capability judge takes the turns they cannot, and
 /// the picker's default tier closes the cascade so a turn is never left unrouted.
 pub struct StageRouter {
-    route: FallThrough<State>,
+    route: FallThrough,
 }
 
 impl StageRouter {
@@ -212,7 +212,7 @@ impl Algorithm for StageRouter {
 
 /// Wires the cascade the wrapper drives. Exposed so a composition above can
 /// stack a prelude onto it.
-pub(crate) fn build_stage_route(config: StageRouterConfig) -> Result<FallThrough<State>> {
+pub(crate) fn build_stage_route(config: StageRouterConfig) -> Result<FallThrough> {
     for (name, threshold) in [
         ("confidence_threshold", config.confidence_threshold),
         ("capable_first_threshold", config.capable_first_threshold),
@@ -237,7 +237,7 @@ pub(crate) fn build_stage_route(config: StageRouterConfig) -> Result<FallThrough
         recent_window: config.recent_window.unwrap_or(DEFAULT_RECENT_WINDOW),
         tool_semantics: config.tool_semantics,
     };
-    let mut router = FallThrough::<State>::new_with_state()
+    let mut router = FallThrough::new_with_state()
         .with_name(STAGE_ROUTER)
         .with_processor(Arc::new(signals))
         .with_classifier(Arc::new(classifier));
@@ -273,17 +273,17 @@ mod tests {
     use parking_lot::Mutex;
 
     use super::*;
-    use crate::algorithms::util::stage::{DECISION_SOURCE_KEY, clear_fall_open, set_fall_open};
+    use crate::algorithms::util::affinity::ClassifyTrigger;
+    use crate::algorithms::util::stage::{clear_fall_open, set_fall_open};
     use crate::algorithms::util::tier_fixtures::{JUDGE, Recorder, turn_request};
-    use crate::core::state::StateValue;
-    use crate::core::testing::{empty_driver, test_drive_with_models};
+    use crate::core::testing::test_drive_with_models;
     use switchyard_protocol::{Category, ModelId};
 
     /// A classifier that always picks `target`, standing in for a cascade member.
     struct Fixed(&'static str);
 
     #[async_trait]
-    impl Classifier<State> for Fixed {
+    impl Classifier for Fixed {
         async fn score(
             &self,
             _state: &mut State,
@@ -305,7 +305,7 @@ mod tests {
     struct Abstains;
 
     #[async_trait]
-    impl Classifier<State> for Abstains {
+    impl Classifier for Abstains {
         async fn score(
             &self,
             _state: &mut State,
@@ -316,19 +316,29 @@ mod tests {
         }
     }
 
-    async fn stamped(inner: Arc<dyn Classifier<State>>) -> Result<Option<String>> {
+    async fn stamped(inner: Arc<dyn Classifier>) -> Result<Option<String>> {
         let stamp = SourceStamp {
             inner,
             source: DecisionSource::LlmClassifier,
         };
-        let mut state = State::default();
+        let (driver, mut rx) = Driver::new("test", Arc::new(crate::RuntimeModels::default()));
         stamp
-            .score(&mut state, &mut Request::default(), &empty_driver())
+            .score(&mut State::default(), &mut Request::default(), &driver)
             .await?;
-        Ok(match state.extra.get(DECISION_SOURCE_KEY) {
-            Some(StateValue::String(source)) => Some(source.clone()),
-            _ => None,
-        })
+        driver
+            .finish(Ok(crate::RoutingOutcome::route_to(
+                "strong".into(),
+                Vec::new(),
+                Request::default(),
+            )))
+            .await?;
+        let Some(Ok(crate::Step::Done(outcome))) = rx.recv().await else {
+            panic!("expected Done step");
+        };
+        Ok(outcome
+            .metadata
+            .and_then(|metadata| metadata.evidence)
+            .and_then(|evidence| evidence.get("source")?.as_str().map(str::to_string)))
     }
 
     #[tokio::test]
@@ -440,7 +450,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl Processor<State> for TierDecider {
+    impl Processor for TierDecider {
         async fn process(&self, state: &mut State, event: Event<'_>) -> Result<()> {
             if matches!(event, Event::Request { .. }) {
                 let mut requests = self.requests.lock();
@@ -615,6 +625,37 @@ mod tests {
             2,
             "each undecided turn is its own question"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_fallback_judge_ignores_the_retaining_triggers() -> Result<()> {
+        for trigger in [ClassifyTrigger::UserTurn, ClassifyTrigger::NewSession] {
+            let recorder = Arc::new(Recorder::default());
+            let mut config = config_with_judge(&recorder, 0.9);
+            config
+                .llm_fallback
+                .as_mut()
+                .expect("config_with_judge sets a judge")
+                .config
+                .classify_trigger = trigger;
+            let router = recording_router(config)?;
+
+            // Two tool continuations of one user turn in one session. A standalone
+            // capability route with this trigger would judge once and retain the
+            // target; inside the stage cascade the judge is a plain classifier.
+            for _ in 0..2 {
+                test_drive_with_models(
+                    router.clone(),
+                    turn_request(false),
+                    runtime_models(),
+                    recorder.serve(),
+                )
+                .await?;
+            }
+
+            assert_eq!(recorder.judge_calls(), 2, "{trigger:?} retained a verdict");
+        }
         Ok(())
     }
 

@@ -19,6 +19,7 @@ use switchyard_llm_client::{
 };
 use switchyard_protocol::{ModelId, RoutedDecisionClient, RoutedLlmClient, WireFormat};
 
+use crate::runner::ModelPropertiesProbe;
 use crate::{
     AlgorithmSpec, AuxiliaryTarget, CallerAuthKind, DecisionTarget, ModelCapabilities, Route,
     Runner, RunnerError,
@@ -82,27 +83,6 @@ pub(crate) fn runner_from_toml(source: &str) -> RunnerResult<Runner> {
     let config: DeploymentConfig = toml::from_str(source).map_err(|error| {
         RunnerError::configuration_source(format!("failed to parse TOML: {error}"), error)
     })?;
-    config.build()
-}
-
-pub(crate) fn model_selection_from_toml(source: &str) -> RunnerResult<Runner> {
-    let config: DeploymentConfig = toml::from_str(source).map_err(|error: toml::de::Error| {
-        // Report the location while keeping document excerpts in the source error.
-        let mut message = "failed to parse TOML".to_string();
-        if let Some(prefix) = error.span().and_then(|span| source.get(..span.start)) {
-            let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
-            let column = prefix
-                .rsplit('\n')
-                .next()
-                .unwrap_or_default()
-                .chars()
-                .count()
-                + 1;
-            message = format!("{message} at line {line}, column {column}");
-        }
-        RunnerError::configuration_source(message, error)
-    })?;
-    config.validate_model_selection()?;
     config.build()
 }
 
@@ -200,36 +180,6 @@ impl RouteConfig {
 }
 
 impl DeploymentConfig {
-    fn validate_model_selection(&self) -> RunnerResult<()> {
-        for (name, client) in &self.llm_clients {
-            if client.forward_auth {
-                return Err(RunnerError::configuration(format!(
-                    "llm client {name}: model selection requires configured classifier credentials"
-                )));
-            }
-        }
-        for (name, route) in &self.routes {
-            if !route.algorithm.supports_model_selection() {
-                return Err(RunnerError::configuration(format!(
-                    "route {name}: model selection requires auto, passthrough, or capability llm_classifier with every_request"
-                )));
-            }
-            for target_name in route.routing_target_names() {
-                if let Some(target) = self.targets.get(target_name)
-                    && (target.system_prompt.is_some()
-                        || target.reasoning_effort.is_some()
-                        || !target.extra_body.is_empty()
-                        || !target.omit_body_fields.is_empty())
-                {
-                    return Err(RunnerError::configuration(format!(
-                        "target {target_name}: model selection requires completion settings to be owned by the caller"
-                    )));
-                }
-            }
-        }
-        Ok(())
-    }
-
     fn decision_target(&self, name: &str) -> Option<DecisionTarget> {
         let target = self.targets.get(name)?;
         let client = self.llm_clients.get(&target.llm_client)?;
@@ -318,6 +268,7 @@ impl DeploymentConfig {
         let targets = self.build_targets();
         let fallback_base_url = self.fallback_base_url()?;
         let mut routes = Vec::with_capacity(self.routes.len());
+        let mut model_properties_probes = BTreeMap::new();
         for (route_name, config) in &self.routes {
             let decision_judge = config.algorithm.decision_judge();
             for name in config.callable_target_names() {
@@ -353,6 +304,11 @@ impl DeploymentConfig {
                 .algorithm
                 .build_with_runtime_models(route_name, &targets)
                 .map_err(|error| RunnerError::configuration_source(error.to_string(), error))?;
+            if let AlgorithmSpec::Vgr { config: vgr } = &config.algorithm
+                && let Some(probe) = self.build_model_properties_probe(&vgr.local_target, &clients)
+            {
+                model_properties_probes.insert(config.id.clone(), probe);
+            }
             let (route_clients, caller_auth) =
                 self.build_route_clients(route_name, config, &clients, &decision_clients)?;
             let anthropic_auxiliary_target =
@@ -378,7 +334,8 @@ impl DeploymentConfig {
         }
         let runner = Runner::new(routes)
             .with_fallback_url(fallback_base_url)
-            .with_provider_api_keys(provider_api_keys);
+            .with_provider_api_keys(provider_api_keys)
+            .with_model_properties_probes(model_properties_probes);
         Ok(runner)
     }
 
@@ -678,6 +635,27 @@ impl DeploymentConfig {
         Ok(Some(config.base_url.as_str().to_string()))
     }
 
+    fn build_model_properties_probe(
+        &self,
+        local_target_name: &str,
+        clients: &BTreeMap<String, Arc<TranslatingLlmClient>>,
+    ) -> Option<ModelPropertiesProbe> {
+        let local_target = self.targets.get(local_target_name)?;
+        let client_config = self.llm_clients.get(&local_target.llm_client)?;
+        if !matches!(
+            client_config.context_discovery,
+            Some(ContextDiscovery::LlamaCpp)
+        ) {
+            return None;
+        }
+        let client = clients.get(&local_target.llm_client)?;
+        Some(ModelPropertiesProbe {
+            model: local_target.id.clone(),
+            format: client_config.format.wire_format(),
+            client: Arc::clone(client),
+        })
+    }
+
     fn build_anthropic_auxiliary_target(
         &self,
         route: &RouteConfig,
@@ -771,6 +749,8 @@ impl<'de> Deserialize<'de> for HttpBaseUrl {
 struct LlmClientConfig {
     format: ClientFormat,
     base_url: HttpBaseUrl,
+    /// Opt-in context discovery for VGR's local target. Unset disables discovery.
+    context_discovery: Option<ContextDiscovery>,
     api_key_env: Option<String>,
     #[serde(default)]
     forward_auth: bool,
@@ -800,6 +780,12 @@ struct LlmClientConfig {
     /// `400 "Cannot determine type of 'item'"`). Default `preserve` sends the caller's
     /// items, which hosted providers define.
     responses_custom_tools: Option<ResponsesCustomToolPolicy>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ContextDiscovery {
+    LlamaCpp,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1251,6 +1237,58 @@ classify_trigger = "user_turn"
         }
     }
 
+    fn vgr_config() -> String {
+        format!(
+            r#"{VALID_CONFIG}
+
+[routes.vgr]
+id = "switchyard/vgr"
+type = "vgr"
+local_target = "weak"
+cloud_target = "strong"
+judge_target = "classifier"
+mode = "active"
+active_approval = "prospective-validation-and-canary-approved"
+task_typing = false
+"#
+        )
+    }
+
+    #[test]
+    fn vgr_route_builds_and_rejects_unsafe_configuration() -> RunnerResult<()> {
+        let runner = runner_from_toml(&vgr_config())?;
+        assert!(runner.route("switchyard/vgr").is_some());
+
+        let compact = format!("{}\ncompact_handoff = true\n", vgr_config());
+        assert!(error_message(&compact).contains("unknown field `compact_handoff`"));
+
+        let identical_ids =
+            vgr_config().replace("local_target = \"weak\"", "local_target = \"strong\"");
+        assert!(error_message(&identical_ids).contains("distinct local and cloud model IDs"));
+
+        let bad_approval =
+            vgr_config().replace("prospective-validation-and-canary-approved", "approved");
+        assert!(error_message(&bad_approval).contains("approval attestation"));
+
+        let missing_target =
+            vgr_config().replace("local_target = \"weak\"", "local_target = \"missing\"");
+        assert!(error_message(&missing_target).contains("unknown target missing"));
+        Ok(())
+    }
+
+    #[test]
+    fn vgr_local_server_example_builds_and_rejects_unknown_discovery() -> RunnerResult<()> {
+        let example = include_str!("../../../examples/vgr-local-servers.toml");
+        let runner = runner_from_toml(example)?;
+        assert!(runner.route("switchyard/vgr").is_some());
+        let invalid = example.replace(
+            "context_discovery = \"llama_cpp\"",
+            "context_discovery = \"guess\"",
+        );
+        assert!(error_message(&invalid).contains("unknown variant `guess`"));
+        Ok(())
+    }
+
     fn with_subagent_llm_classifier(config: &str, route: &str, extra: &str) -> String {
         let mut configured = config.to_string();
         configured.push_str(&format!("\n[routes.{route}.subagents]\n"));
@@ -1382,6 +1420,39 @@ evidence = { description = "candidate comparison" }
                 valid
             );
         }
+    }
+
+    #[test]
+    fn composite_custom_judge_builds_and_rejects_capability_settings() -> RunnerResult<()> {
+        let source = composite_config().replace(
+            "base_threshold = 0.5\nclassify_trigger",
+            r#"mode = "custom"
+prompt = 'Select efficient or capable.'
+response_schema = '{"type":"object","properties":{"decision":{"type":"object","properties":{"target":{"type":"string","enum":["efficient","capable"]}},"required":["target"],"additionalProperties":false}},"required":["decision"],"additionalProperties":false}'
+policy = { type = "target_selector", selector = "/decision/target" }
+classify_trigger"#,
+        );
+        runner_from_toml(&source)?;
+        runner_from_toml(
+            &source.replace("mode = \"custom\"", "mode = \"custom\"\nfail_open = true"),
+        )?;
+        for (setting, expected) in [
+            (
+                "base_threshold = 0.5",
+                "composite custom classifier cannot use capability thresholds",
+            ),
+            (
+                "fail_open = false",
+                "composite custom classifiers always fail open",
+            ),
+        ] {
+            let invalid = source.replace(
+                "mode = \"custom\"",
+                &format!("mode = \"custom\"\n{setting}"),
+            );
+            assert!(error_message(&invalid).contains(expected));
+        }
+        Ok(())
     }
 
     #[test]

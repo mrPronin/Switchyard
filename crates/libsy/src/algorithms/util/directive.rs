@@ -15,6 +15,7 @@ use switchyard_protocol::{Category, ContentBlock, Request, Response};
 use super::affinity::is_user_turn;
 use crate::core::algorithm::Driver;
 use crate::core::classifier::{Classification, Classifier, Score};
+use crate::core::state::State;
 use crate::{LibsyError, Result};
 
 /// One compiled directive: a pattern and the group it routes to.
@@ -90,10 +91,10 @@ fn latest_user_text(request: &Request) -> Option<String> {
 }
 
 #[async_trait]
-impl<S: Send> Classifier<S> for DirectiveClassifier {
+impl Classifier for DirectiveClassifier {
     async fn score(
         &self,
-        _state: &mut S,
+        _state: &mut State,
         request: &mut Request,
         driver: &Driver,
     ) -> Result<(Classification, Option<Response>)> {
@@ -185,7 +186,7 @@ mod tests {
 
     async fn routed(classifier: &DirectiveClassifier, messages: Vec<Message>) -> Option<ModelId> {
         let (classification, _) = classifier
-            .score(&mut (), &mut request(messages), &driver())
+            .score(&mut State::default(), &mut request(messages), &driver())
             .await
             .unwrap();
         classification
