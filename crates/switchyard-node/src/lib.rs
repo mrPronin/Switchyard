@@ -66,6 +66,7 @@ struct DecisionOptions {
     candidates: BTreeMap<String, Candidate>,
     evidence: Value,
     instructions: Option<Value>,
+    criteria: Option<BTreeMap<String, Value>>,
 }
 
 #[derive(Deserialize)]
@@ -80,6 +81,7 @@ enum Candidate {
 struct StageOptions {
     efficient_first_threshold: f64,
     capable_first_threshold: f64,
+    efficient_hold_turns: Option<i64>,
 }
 
 #[napi]
@@ -118,6 +120,7 @@ impl NativeComposite {
         let mut stage_config =
             StageRouterConfig::new(PickerMode::EfficientFirst, stage.efficient_first_threshold);
         stage_config.capable_first_threshold = stage.capable_first_threshold;
+        stage_config.efficient_hold_turns = stage.efficient_hold_turns;
         let router = CompositeRouter::new(CompositeRouterConfig {
             judge: CompositeJudgeConfig::Capability(TaskClassifierConfig {
                 judge: CapabilityJudgeConfig::Decision(DecisionJudgeConfig {
@@ -125,6 +128,7 @@ impl NativeComposite {
                     candidates,
                     evidence: decision.evidence,
                     instructions: decision.instructions,
+                    criteria: decision.criteria,
                 }),
                 classify_trigger: classifier.classify_trigger,
                 fail_open: classifier.fail_open,

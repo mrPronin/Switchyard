@@ -10,9 +10,9 @@ use serde_json::Value;
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ResponsesReasoningPolicy {
-    /// Preserve provider-encrypted reasoning but remove plaintext reasoning.
+    /// Preserve encrypted reasoning and stored IDs the provider can read.
     ///
-    /// This is the safe default for strict hosted Responses providers.
+    /// This is the default for every Responses model, regardless of its URL.
     #[default]
     PreserveEncrypted,
     /// Drop all reasoning items while preserving messages and tool-call history.
@@ -25,21 +25,23 @@ pub enum ResponsesReasoningPolicy {
 impl ResponsesReasoningPolicy {
     /// Normalizes a Responses request body for this replay policy.
     pub(crate) fn normalize(self, body: &mut Value) {
+        let has_stored_reasoning = body.get("store").and_then(Value::as_bool) != Some(false);
         let Some(Value::Array(input)) = body.get_mut("input") else {
             return;
         };
-        input.retain_mut(|item| self.normalize_item(item));
+        input.retain_mut(|item| self.normalize_item(item, has_stored_reasoning));
     }
 
-    fn normalize_item(self, item: &mut Value) -> bool {
+    // Stored reasoning can be replayed by ID without encrypted content.
+    fn normalize_item(self, item: &mut Value, has_stored_reasoning: bool) -> bool {
         let Some(object) = item.as_object_mut() else {
             return true;
         };
 
-        // ⛔ A Responses item that reaches an upstream without a `type` is rejected as
-        // "Cannot determine type of 'item'" — measured against llama.cpp 2026-09-16.
-        // A `{role, content}` item unambiguously IS a message, so name it rather than
-        // forward an unroutable shape; dropping it would delete conversation content.
+        // ⛔ prod/minisrv. A Responses item that reaches an upstream without a `type` is
+        // rejected as "Cannot determine type of 'item'" — measured against llama.cpp
+        // 2026-09-16. A `{role, content}` item unambiguously IS a message, so name it rather
+        // than forward an unroutable shape; dropping it would delete conversation content.
         //
         // ⚠ This is reached when one provider's replayed output is sent to another,
         // which is exactly what a tier switch does: a hosted turn's assistant items are
@@ -51,13 +53,14 @@ impl ResponsesReasoningPolicy {
             object.insert("type".to_string(), Value::from("message"));
         }
 
-        // ⛔ A hosted provider's server-side web search is replayed as a `web_search_call`
-        // item, which llama.cpp also rejects as "Cannot determine type of 'item'" —
-        // measured 2026-10-08: a mini-team session whose planner had searched the web
-        // 400'd on every later turn, in the box judge, before any target was chosen.
-        // The search's findings live in the assistant message that follows it; the item
-        // only records that a search ran. A local upstream cannot run or read it, so
-        // `Drop` (the policy every local client sets) removes it like reasoning.
+        // ⛔ prod/minisrv (upstream PR #955 proposes the same rule). A hosted provider's
+        // server-side web search is replayed as a `web_search_call` item, which llama.cpp
+        // also rejects as "Cannot determine type of 'item'" — measured 2026-10-08: a
+        // mini-team session whose planner had searched the web 400'd on every later turn, in
+        // the box judge, before any target was chosen. The search's findings live in the
+        // assistant message that follows it; the item only records that a search ran. A
+        // local upstream cannot run or read it, so `Drop` (the policy every local client
+        // sets) removes it like reasoning.
         if self == Self::Drop
             && object.get("type").and_then(Value::as_str) == Some("web_search_call")
         {
@@ -68,11 +71,18 @@ impl ResponsesReasoningPolicy {
             return true;
         }
 
-        let signed = matches!(
-            object.get("encrypted_content").and_then(Value::as_str),
-            Some(encrypted_content) if !encrypted_content.is_empty()
-        );
-        if self == Self::PreserveEncrypted && signed {
+        let encrypted_content = object.get("encrypted_content").and_then(Value::as_str);
+        if encrypted_content.is_some_and(switchyard_translation::is_anthropic_thinking_envelope) {
+            return false;
+        }
+        let has_encrypted_content = encrypted_content.is_some_and(|content| !content.is_empty());
+        let has_stored_id = object
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty());
+        if self == Self::PreserveEncrypted
+            && (has_encrypted_content || (has_stored_reasoning && has_stored_id))
+        {
             object.insert("content".to_string(), Value::Array(Vec::new()));
             true
         } else {

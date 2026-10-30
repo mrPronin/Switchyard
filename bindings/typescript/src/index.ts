@@ -16,9 +16,15 @@ export interface CompositeOptions {
       candidates: Record<string, "capable" | "efficient">;
       evidence: unknown;
       instructions?: unknown;
+      criteria?: Record<string, unknown>;
     };
   };
-  stage: { efficient_first_threshold: number; capable_first_threshold: number };
+  stage: {
+    efficient_first_threshold: number;
+    capable_first_threshold: number;
+    /** Defaults to -1 for capable-first, otherwise 0. Set 0 to disable the hold. */
+    efficient_hold_turns?: number;
+  };
 }
 
 export interface Selection {
